@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.15 (Final)
+meta_field_distributed.py v1.16
 
-Stable distributed HMC + strong Learned Information Geometry layer.
-This is currently the best overall version of the system.
+Phase 1 + early Phase 2 foundation:
+- ExperienceBuffer (memory of interesting states)
+- LatentPredictor (basic prediction / expectation formation)
 
-Foundation is solid for future "information-learned AI" work.
+This is the first concrete step toward an agent that grows inside
+its own simulated universe rather than just generating one.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import List
+from typing import List, Dict
 
 import torch
 import torch.distributed as dist
@@ -60,11 +62,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.15 (Final)")
+    print("  MetaField Distributed v1.16 - Memory + Prediction Layer")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + GEOMETRY]")
+        print("   [DIAGNOSTIC + EXPERIENCE + PREDICTION]")
     print()
 
 
@@ -109,6 +111,59 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     if max_v == min_v: return "=" * width
     scale = (max_v - min_v) or 1.0
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
+
+
+# ==================== Experience Buffer (Memory) ====================
+
+class ExperienceBuffer:
+    """
+    Stores interesting states the system has seen.
+    This is the beginning of episodic + geometric memory.
+    """
+    def __init__(self, max_size: int = 512):
+        self.max_size = max_size
+        self.buffer: List[Dict] = []
+
+    def add(self, latent: torch.Tensor, action: float, delta_h: float, accepted: bool, curvature: float = 0.0):
+        entry = {
+            "latent": latent.detach().cpu().clone(),
+            "action": float(action),
+            "delta_h": float(delta_h),
+            "accepted": bool(accepted),
+            "curvature": float(curvature),
+        }
+        self.buffer.append(entry)
+        if len(self.buffer) > self.max_size:
+            self.buffer.pop(0)  # simple FIFO for now
+
+    def sample(self, n: int = 32):
+        if len(self.buffer) < n:
+            return self.buffer
+        indices = torch.randperm(len(self.buffer))[:n]
+        return [self.buffer[i] for i in indices]
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ==================== Latent Predictor (Early Phase 2) ====================
+
+class LatentPredictor(nn.Module):
+    """
+    Simple predictor that tries to form expectations about the universe.
+    Currently predicts next action from latent state.
+    This is the seed of 'what will happen next?' reasoning.
+    """
+    def __init__(self, latent_dim: int = 8, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, z):
+        return self.net(z)
 
 
 # ==================== Learned Information Geometry ====================
@@ -425,12 +480,50 @@ def main():
     pseudo = DistributedPseudofermionField(lat, dirac, config, gen) if config.include_fermions else None
     hmc = DistributedHMC(gauge, dirac, config, gen, pseudo, diagnostic=args.diagnostic)
 
+    # New: Experience buffer + predictor (only on rank 0)
+    experience = ExperienceBuffer(max_size=256) if (args.diagnostic and rank == 0) else None
+    predictor = LatentPredictor(latent_dim=8).to(torch.float64) if (args.diagnostic and rank == 0) else None
+    predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-3) if predictor is not None else None
+
     if rank == 0:
         mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED (gauge only)"
         print(f"Starting {mode} HMC on {world_size} rank(s)...\n")
 
+    geometry = None
+
     for t in range(config.hmc_trajectories):
         res = hmc.trajectory()
+
+        if rank == 0 and args.diagnostic and experience is not None:
+            # Encode current state into latent space for memory
+            if len(hmc.field_samples) > 0:
+                with torch.no_grad():
+                    z = geometry.encode(hmc.field_samples[-1]) if geometry is not None else torch.zeros(8)
+
+                # Store experience
+                experience.add(
+                    latent=z,
+                    action=res.get("action", hmc.action_history[-1] if hmc.action_history else 0.0),
+                    delta_h=res["delta_h"],
+                    accepted=res["accepted"],
+                )
+
+                # Simple online prediction attempt
+                if predictor is not None and len(experience) > 8:
+                    batch = experience.sample(16)
+                    z_batch = torch.stack([b["latent"] for b in batch]).to(torch.float64)
+                    target = torch.tensor([b["action"] for b in batch], dtype=torch.float64).unsqueeze(1)
+
+                    pred = predictor(z_batch)
+                    pred_loss = torch.mean((pred - target) ** 2)
+
+                    predictor_optimizer.zero_grad()
+                    pred_loss.backward()
+                    predictor_optimizer.step()
+
+                    if t % 5 == 0:
+                        print(f"  [Prediction] Loss = {pred_loss.item():.4e} | Buffer size = {len(experience)}")
+
         if rank == 0:
             status = "ACCEPTED" if res["accepted"] else "REJECTED"
             print(f"traj {t:02d} | dH={res['delta_h']:+.4f} | {status} (rate={res['acceptance_rate']:.2f})")
