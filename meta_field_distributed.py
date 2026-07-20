@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.11
-Improved geometry: more samples + longer training + 2D latent visualization
+meta_field_distributed.py v1.12
+Improved geometry layer toward information-learned representations
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-    HAS_MATPLOTLIB = False
 
 try:
     import matplotlib.pyplot as plt
@@ -57,7 +56,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.11 - Better Geometry")
+    print("  MetaField Distributed v1.12 - Stronger Geometry Layer")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -108,7 +107,7 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Learned Information Geometry ====================
+# ==================== Learned Information Geometry v2 ====================
 
 class _MLP(nn.Module):
     def __init__(self, dims, dtype=torch.float64):
@@ -125,7 +124,14 @@ class _MLP(nn.Module):
 
 
 class LearnedInformationGeometry:
-    def __init__(self, input_dim: int, latent_dim: int = 6, hidden_dims=(256, 128), sigma: float = 1.0, lr: float = 5e-4):
+    """
+    Improved geometry module.
+    - Better training
+    - Improved curvature estimation (averaged)
+    - Support for richer field data
+    """
+
+    def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dims=(256, 128), sigma: float = 1.0, lr: float = 3e-4):
         self.latent_dim = latent_dim
         self.sigma = sigma
         dtype = torch.float64
@@ -140,7 +146,7 @@ class LearnedInformationGeometry:
         self.optimizer = torch.optim.Adam(params, lr=lr)
         self.last_loss = None
 
-    def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 25) -> float:
+    def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 30) -> float:
         if not samples:
             return 0.0
         x = torch.stack(samples).to(torch.float64)
@@ -168,31 +174,39 @@ class LearnedInformationGeometry:
             z2d = pca.fit_transform(z.numpy())
         else:
             z2d = z[:, :2].numpy()
-        return z2d, [float(s.mean()) for s in samples]  # color by mean action proxy
+        # Color by mean absolute value as a simple proxy
+        colors = [float(torch.abs(s).mean()) for s in samples]
+        return z2d, colors
 
     def fisher_metric(self, z: torch.Tensor):
         J = torch.func.jacrev(self.decoder)(z)
         G = (J.T @ J) / (self.sigma ** 2)
         return G
 
-    def scalar_curvature(self, z: torch.Tensor, eps: float = 1e-3):
+    def scalar_curvature(self, z: torch.Tensor, n_points: int = 8, eps: float = 1e-3):
+        """Improved curvature: average over several points in latent space."""
         G = self.fisher_metric(z)
         try:
             G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0], dtype=G.dtype))
         except:
             return float('nan')
+
         dim = self.latent_dim
-        curv = 0.0
-        for i in range(dim):
-            for j in range(dim):
-                if i == j: continue
-                step = torch.zeros(dim, dtype=z.dtype)
-                step[i] = eps
-                G_plus = self.fisher_metric(z + step)
-                G_minus = self.fisher_metric(z - step)
-                dG = (G_plus - G_minus) / (2 * eps)
-                curv += torch.trace(G_inv @ dG)
-        return float(curv)
+        total_curv = 0.0
+        for _ in range(n_points):
+            z_point = z + torch.randn_like(z) * 0.1
+            curv = 0.0
+            for i in range(dim):
+                for j in range(dim):
+                    if i == j: continue
+                    step = torch.zeros(dim, dtype=z.dtype)
+                    step[i] = eps
+                    G_plus = self.fisher_metric(z_point + step)
+                    G_minus = self.fisher_metric(z_point - step)
+                    dG = (G_plus - G_minus) / (2 * eps)
+                    curv += torch.trace(G_inv @ dG)
+            total_curv += curv
+        return float(total_curv / n_points)
 
 
 class DistributedLattice:
@@ -311,6 +325,7 @@ class DistributedPseudofermionField:
         self.config = config
         self.generator = generator
         self.phi = None
+        self.last_x = None   # store last CG solution for geometry
 
     def refresh(self, U):
         shape = self.lattice.local_padded_shape + (self.config.spinor_dim, self.config.color_dim)
@@ -318,6 +333,9 @@ class DistributedPseudofermionField:
         imag = torch.randn(shape, generator=self.generator, dtype=torch.float64, device=self.lattice.device)
         eta = (real + 1j * imag).to(self.config.dtype)
         self.phi = self.dirac.apply_dagger(eta, U)
+
+    def get_last_solution(self):
+        return self.last_x
 
 
 class DistributedHMC:
@@ -379,7 +397,11 @@ class DistributedHMC:
             lat.update_halo_gauge(self.gauge.U)
 
             if self.diagnostic and self.lattice.rank == 0:
-                flat = self.gauge.U.detach().flatten().real[:8192]
+                # Prefer pseudofermion solution if available (richer data)
+                if self.pseudo is not None and hasattr(self.pseudo, 'last_x') and self.pseudo.last_x is not None:
+                    flat = self.pseudo.last_x.detach().flatten().real[:8192]
+                else:
+                    flat = self.gauge.U.detach().flatten().real[:8192]
                 self.field_samples.append(flat)
 
         self.action_history.append(action1)
@@ -398,7 +420,7 @@ def main():
         beta=5.5,
         hmc_n_leapfrog=20,
         hmc_step_size=0.012,
-        hmc_trajectories=20,   # more trajectories = more samples
+        hmc_trajectories=25,   # more trajectories = richer dataset
         include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
@@ -427,19 +449,19 @@ def main():
     if rank == 0:
         print("\nRun finished.")
 
-        if args.diagnostic and len(hmc.field_samples) > 8:
-            print("\n=== Learned Information Geometry (Improved) ===")
+        if args.diagnostic and len(hmc.field_samples) > 10:
+            print("\n=== Learned Information Geometry v2 ===")
             input_dim = hmc.field_samples[0].shape[0]
-            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=6)
+            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
-            loss = geometry.train_on_batch(hmc.field_samples, epochs=25)
-            print(f"Final AE loss after 25 epochs: {loss:.4e}")
+            loss = geometry.train_on_batch(hmc.field_samples, epochs=30)
+            print(f"Final AE loss after 30 epochs: {loss:.4e}")
 
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
 
-            print(f"Latent scalar curvature (approx): {R:.4f}")
+            print(f"\nLatent scalar curvature (improved estimate): {R:.4f}")
 
             # 2D Latent visualization
             if HAS_MATPLOTLIB:
@@ -447,11 +469,11 @@ def main():
                     z2d, colors = geometry.get_latent_2d(hmc.field_samples)
                     if z2d is not None:
                         plt.figure(figsize=(7, 5))
-                        scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=60, alpha=0.8)
-                        plt.colorbar(scatter, label='Mean field value (proxy)')
-                        plt.title('2D Latent Space of Gauge Configurations')
-                        plt.xlabel('PC1 / Latent dim 1')
-                        plt.ylabel('PC2 / Latent dim 2')
+                        scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=50, alpha=0.85)
+                        plt.colorbar(scatter, label='Mean |field| (proxy)')
+                        plt.title('2D Latent Space of Field Configurations')
+                        plt.xlabel('Latent Dim 1 (PC1)')
+                        plt.ylabel('Latent Dim 2 (PC2)')
                         plt.tight_layout()
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
