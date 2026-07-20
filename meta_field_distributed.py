@@ -3,9 +3,8 @@
 meta_field_distributed.py
 =========================
 
-**User-friendly** domain-decomposed (1D) distributed MetaField v2 (v1.3 - autograd fix).
-
-This version fixes the RuntimeError in force() where autograd could not find grad_fn.
+MetaField Distributed v1.4
+Improved default HMC parameters for decent acceptance on small lattices.
 """
 
 from __future__ import annotations
@@ -46,16 +45,15 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.3  —  Autograd Fix for force()")
+    print("  MetaField Distributed v1.4")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
-    print("=" * 72)
     if world_size > 1 and role in ("control", "auto"):
-        print(f"\n[CONTROL] On worker run: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size}")
+        print(f"\n[CONTROL] Worker command: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size}")
     print()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--role", choices=["auto", "control", "worker"], default="auto")
     p.add_argument("--world-size", type=int, default=2)
@@ -72,13 +70,11 @@ def init_distributed(args):
     master_addr = args.master_addr if args.master_addr != "auto" else get_local_ip()
     master_port = args.master_port
     rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
-    if role == "control":
-        rank = 0
+    if role == "control": rank = 0
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("MASTER_ADDR", master_addr)
     os.environ.setdefault("MASTER_PORT", str(master_port))
     os.environ["RANK"] = str(rank)
-
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend=args.backend, rank=rank, world_size=world_size, init_method="env://")
     print_banner(rank, world_size, role, master_addr, master_port)
@@ -86,12 +82,11 @@ def init_distributed(args):
 
 
 def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    if dist.is_initialized(): dist.destroy_process_group()
 
 
 class DistributedLattice:
-    def __init__(self, config: ConfigV2, rank: int, world_size: int):
+    def __init__(self, config, rank, world_size):
         self.config = config
         self.rank = rank
         self.world_size = world_size
@@ -162,7 +157,7 @@ class DistributedGaugeField:
 
     def force(self):
         U = self.U.detach().clone().requires_grad_(True)
-        S = self.wilson_action(U)          # pass differentiable U
+        S = self.wilson_action(U)
         grad = torch.autograd.grad(S, U)[0]
         return project_traceless_antihermitian(U.detach() @ dagger(grad.detach()))
 
@@ -228,8 +223,7 @@ class DistributedHMC:
         cfg, lat = self.config, self.lattice
         U0 = self.gauge.U.clone()
         P0 = random_su_n_hermitian(U0.shape, cfg.color_dim, cfg.dtype, U0.device, self.generator)
-        if self.pseudo:
-            self.pseudo.refresh(U0)
+        if self.pseudo: self.pseudo.refresh(U0)
 
         kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H0 = lat.global_sum(kinetic0) + self.gauge.wilson_action()
@@ -265,12 +259,21 @@ def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
 
-    config = ConfigV2(L=4, beta=5.5, hmc_n_leapfrog=6, hmc_step_size=0.04,
-                      hmc_trajectories=3, include_fermions=True, seed=42+rank,
-                      device="cpu", dtype=torch.complex128)
+    # Improved defaults for better acceptance on L=4
+    config = ConfigV2(
+        L=4,
+        beta=5.5,
+        hmc_n_leapfrog=12,
+        hmc_step_size=0.025,
+        hmc_trajectories=12,
+        include_fermions=True,
+        seed=42 + rank,
+        device="cpu",
+        dtype=torch.complex128,
+    )
 
     torch.manual_seed(config.seed)
-    gen = torch.Generator().manual_seed(config.seed + rank*777)
+    gen = torch.Generator().manual_seed(config.seed + rank * 777)
 
     lat = DistributedLattice(config, rank, world_size)
     gauge = DistributedGaugeField(lat, config, gen)
@@ -279,7 +282,8 @@ def main():
     hmc = DistributedHMC(gauge, dirac, config, gen, pseudo)
 
     if rank == 0:
-        print(f"Starting {'DYNAMICAL' if config.include_fermions else 'QUENCHED'} HMC on {world_size} rank(s)...\n")
+        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED"
+        print(f"Starting {mode} HMC on {world_size} rank(s)...\n")
 
     for t in range(config.hmc_trajectories):
         res = hmc.trajectory()
