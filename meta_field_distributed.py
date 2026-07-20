@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.6
---include-fermions now accepts true/false
+meta_field_distributed.py v1.7
+--diagnostic mode with history tracking and basic visualization
 """
 
 from __future__ import annotations
@@ -11,10 +11,16 @@ import sys
 import math
 import socket
 import argparse
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import torch.distributed as dist
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -40,13 +46,15 @@ def get_local_ip() -> str:
         s.close()
 
 
-def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int):
+def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.6")
+    print("  MetaField Distributed v1.7  + Diagnostic Mode")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
+    if diagnostic:
+        print("   [DIAGNOSTIC MODE ENABLED]")
     if world_size > 1 and role in ("control", "auto"):
-        print(f"\n[CONTROL] Worker: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size}")
+        print(f"\n[CONTROL] Worker: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size} --diagnostic")
     print()
 
 
@@ -58,8 +66,8 @@ def parse_args():
     p.add_argument("--master-addr", default="auto")
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
-    p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True,
-                   help="Include dynamical fermions (true/false)")
+    p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True)
+    p.add_argument("--diagnostic", action="store_true", default=False, help="Enable diagnostic output and history tracking")
     return p.parse_args()
 
 
@@ -76,13 +84,23 @@ def init_distributed(args):
     os.environ["RANK"] = str(rank)
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend=args.backend, rank=rank, world_size=world_size, init_method="env://")
-    print_banner(rank, world_size, role, master_addr, master_port)
+    print_banner(rank, world_size, role, master_addr, master_port, args.diagnostic)
     return rank, world_size, master_addr, master_port
 
 
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def simple_sparkline(data: List[float], width: int = 40) -> str:
+    if not data:
+        return ""
+    min_v, max_v = min(data), max(data)
+    if max_v == min_v:
+        return "=" * width
+    scale = (max_v - min_v) or 1
+    return ''.join(chr(0x2581 + int((v - min_v) / scale * 7)) for v in data[:width])
 
 
 class DistributedLattice:
@@ -210,14 +228,18 @@ class DistributedPseudofermionField:
 
 
 class DistributedHMC:
-    def __init__(self, gauge, dirac, config, generator, pseudo=None):
+    def __init__(self, gauge, dirac, config, generator, pseudo=None, diagnostic=False):
         self.gauge = gauge
         self.dirac = dirac
         self.config = config
         self.generator = generator
         self.pseudo = pseudo
         self.lattice = gauge.lattice
+        self.diagnostic = diagnostic
         self.n_accepted = self.n_total = 0
+        self.action_history: List[float] = []
+        self.delta_h_history: List[float] = []
+        self.accepted_history: List[bool] = []
 
     def trajectory(self):
         cfg, lat = self.config, self.lattice
@@ -226,8 +248,12 @@ class DistributedHMC:
         if self.pseudo:
             self.pseudo.refresh(U0)
 
+        action0 = float(self.gauge.wilson_action().real)
         kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
-        H0 = lat.global_sum(kinetic0) + self.gauge.wilson_action()
+        H0 = lat.global_sum(kinetic0) + action0
+
+        if self.diagnostic and self.lattice.rank == 0:
+            print(f"  [Diag] Start Action = {action0:.4f}")
 
         U, P = U0.clone(), P0.clone()
         eps = cfg.hmc_step_size
@@ -241,9 +267,13 @@ class DistributedHMC:
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P += coeff * (1j * F)
 
+        action1 = float(self.gauge.wilson_action().real)
         kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
-        H1 = lat.global_sum(kinetic1) + self.gauge.wilson_action()
+        H1 = lat.global_sum(kinetic1) + action1
         delta_h = float((H1 - H0).real)
+
+        if self.diagnostic and self.lattice.rank == 0:
+            print(f"  [Diag] End Action   = {action1:.4f} | raw ΔH = {delta_h:+.4f}")
 
         accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
         accepted = torch.rand((), generator=self.generator).item() < accept_prob
@@ -252,6 +282,10 @@ class DistributedHMC:
             self.n_accepted += 1
             self.gauge.U = U
             lat.update_halo_gauge(U)
+
+        self.action_history.append(action1)
+        self.delta_h_history.append(delta_h)
+        self.accepted_history.append(accepted)
 
         return {"delta_h": delta_h, "accepted": accepted, "acceptance_rate": self.n_accepted / max(1, self.n_total)}
 
@@ -263,9 +297,9 @@ def main():
     config = ConfigV2(
         L=4,
         beta=5.5,
-        hmc_n_leapfrog=15,
-        hmc_step_size=0.015,
-        hmc_trajectories=10,
+        hmc_n_leapfrog=20,
+        hmc_step_size=0.012,
+        hmc_trajectories=12,
         include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
@@ -279,7 +313,7 @@ def main():
     gauge = DistributedGaugeField(lat, config, gen)
     dirac = DistributedWilsonDiracOperator(lat, config)
     pseudo = DistributedPseudofermionField(lat, dirac, config, gen) if config.include_fermions else None
-    hmc = DistributedHMC(gauge, dirac, config, gen, pseudo)
+    hmc = DistributedHMC(gauge, dirac, config, gen, pseudo, diagnostic=args.diagnostic)
 
     if rank == 0:
         mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED (gauge only)"
@@ -293,6 +327,34 @@ def main():
 
     if rank == 0:
         print("\nRun finished.")
+
+        # === Diagnostic Summary ===
+        if args.diagnostic and hmc.delta_h_history:
+            print("\n=== DIAGNOSTIC SUMMARY ===")
+            print(f"Final acceptance rate : {hmc.n_accepted / max(1, hmc.n_total):.2%}")
+            print(f"Mean |\u0394H|            : {sum(abs(d) for d in hmc.delta_h_history) / len(hmc.delta_h_history):.2f}")
+            print(f"Action range          : {min(hmc.action_history):.2f} → {max(hmc.action_history):.2f}")
+
+            print("\n\u0394H history (sparkline):")
+            print(simple_sparkline([abs(d) for d in hmc.delta_h_history]))
+
+            if HAS_MATPLOTLIB:
+                try:
+                    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                    axs[0].plot(hmc.delta_h_history, marker='o', label='\u0394H')
+                    axs[0].axhline(0, color='gray', linestyle='--')
+                    axs[0].set_ylabel('\u0394H')
+                    axs[0].legend()
+                    axs[1].plot([int(a) for a in hmc.accepted_history], marker='o', color='green')
+                    axs[1].set_ylabel('Accepted (1/0)')
+                    axs[1].set_xlabel('Trajectory')
+                    plt.tight_layout()
+                    plt.savefig('hmc_diagnostics.png')
+                    print("\nSaved diagnostic plot to hmc_diagnostics.png")
+                except Exception as e:
+                    print(f"Could not save plot: {e}")
+            else:
+                print("(matplotlib not installed - skipping PNG plot)")
 
     cleanup_distributed()
 
