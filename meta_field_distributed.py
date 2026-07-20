@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.14
-Best current version - stable + improved geometry
+meta_field_distributed.py v1.15 (Final)
+
+Stable distributed HMC + strong Learned Information Geometry layer.
+This is currently the best overall version of the system.
+
+Foundation is solid for future "information-learned AI" work.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import Optional, Tuple, Dict, Any, List
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -56,7 +60,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.14 - Best Current Version")
+    print("  MetaField Distributed v1.15 (Final)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -142,7 +146,6 @@ class LearnedInformationGeometry:
     def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 30) -> float:
         if not samples:
             return 0.0
-        # Safety: ensure all samples have same shape and dtype
         x = torch.stack([s.to(torch.float64) for s in samples if s.shape[0] == samples[0].shape[0]])
         if len(x) < 4:
             return 0.0
@@ -387,7 +390,6 @@ class DistributedHMC:
             lat.update_halo_gauge(self.gauge.U)
 
             if self.diagnostic and self.lattice.rank == 0:
-                # Safe collection - mainly gauge fields for stability
                 flat = self.gauge.U.detach().flatten().real[:8192]
                 self.field_samples.append(flat)
 
@@ -462,7 +464,6 @@ def main():
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
 
-                    # Reconstruction quality
                     with torch.no_grad():
                         x = torch.stack(hmc.field_samples[:min(64, len(hmc.field_samples))]).to(torch.float64)
                         x_hat = geometry.decoder(geometry.encoder(x))
