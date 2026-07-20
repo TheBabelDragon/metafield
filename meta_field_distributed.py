@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.9
-Core HMC working + LearnedInformationGeometry integration in diagnostic mode
+meta_field_distributed.py v1.10
+Dtype fix for LearnedInformationGeometry
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.9  -  HMC + Learned Geometry")
+    print("  MetaField Distributed v1.10")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -100,14 +100,14 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Learned Information Geometry ====================
+# ==================== Learned Information Geometry (float64) ====================
 
 class _MLP(nn.Module):
-    def __init__(self, dims):
+    def __init__(self, dims, dtype=torch.float64):
         super().__init__()
         layers = []
         for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i+1]))
+            layers.append(nn.Linear(dims[i], dims[i+1], dtype=dtype))
             if i < len(dims)-2:
                 layers.append(nn.ReLU())
         self.net = nn.Sequential(*layers)
@@ -117,21 +117,16 @@ class _MLP(nn.Module):
 
 
 class LearnedInformationGeometry:
-    """
-    Lightweight version of LearnedInformationGeometry that runs on rank 0.
-    Trains an autoencoder on field configurations and computes
-    Fisher metric + scalar curvature on the latent space.
-    """
-
     def __init__(self, input_dim: int, latent_dim: int = 4, hidden_dims=(128, 64), sigma: float = 1.0, lr: float = 1e-3):
         self.latent_dim = latent_dim
         self.sigma = sigma
+        dtype = torch.float64
 
         enc_dims = [input_dim, *hidden_dims, latent_dim]
         dec_dims = [latent_dim, *reversed(hidden_dims), input_dim]
 
-        self.encoder = _MLP(enc_dims)
-        self.decoder = _MLP(dec_dims)
+        self.encoder = _MLP(enc_dims, dtype=dtype)
+        self.decoder = _MLP(dec_dims, dtype=dtype)
 
         params = list(self.encoder.parameters()) + list(self.decoder.parameters())
         self.optimizer = torch.optim.Adam(params, lr=lr)
@@ -140,7 +135,7 @@ class LearnedInformationGeometry:
     def train_on_batch(self, samples: List[torch.Tensor]) -> float:
         if not samples:
             return 0.0
-        x = torch.stack(samples)
+        x = torch.stack(samples).to(torch.float64)
         z = self.encoder(x)
         x_hat = self.decoder(z)
         loss = torch.mean((x_hat - x) ** 2)
@@ -151,7 +146,7 @@ class LearnedInformationGeometry:
         return self.last_loss
 
     def encode(self, x: torch.Tensor):
-        return self.encoder(x)
+        return self.encoder(x.to(torch.float64))
 
     def fisher_metric(self, z: torch.Tensor):
         J = torch.func.jacrev(self.decoder)(z)
@@ -161,17 +156,15 @@ class LearnedInformationGeometry:
     def scalar_curvature(self, z: torch.Tensor, eps: float = 1e-3):
         G = self.fisher_metric(z)
         try:
-            G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0]))
+            G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0], dtype=G.dtype))
         except:
             return float('nan')
-
-        # Simple finite-difference approximation of curvature
         dim = self.latent_dim
         curv = 0.0
         for i in range(dim):
             for j in range(dim):
                 if i == j: continue
-                step = torch.zeros(dim)
+                step = torch.zeros(dim, dtype=z.dtype)
                 step[i] = eps
                 G_plus = self.fisher_metric(z + step)
                 G_minus = self.fisher_metric(z - step)
@@ -318,7 +311,7 @@ class DistributedHMC:
         self.action_history: List[float] = []
         self.delta_h_history: List[float] = []
         self.accepted_history: List[bool] = []
-        self.field_samples: List[torch.Tensor] = []   # for geometry training
+        self.field_samples: List[torch.Tensor] = []
 
     def trajectory(self):
         cfg, lat = self.config, self.lattice
@@ -363,9 +356,8 @@ class DistributedHMC:
             self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
 
-            # Collect sample for geometry (only on rank 0)
             if self.diagnostic and self.lattice.rank == 0:
-                flat = self.gauge.U.detach().flatten().real[:4096]  # truncate for speed
+                flat = self.gauge.U.detach().flatten().real[:4096]
                 self.field_samples.append(flat)
 
         self.action_history.append(action1)
@@ -413,25 +405,21 @@ def main():
     if rank == 0:
         print("\nRun finished.")
 
-        # === Learned Information Geometry ===
         if args.diagnostic and len(hmc.field_samples) > 4:
             print("\n=== Learned Information Geometry ===")
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=4)
 
-            # Train
             for epoch in range(5):
                 loss = geometry.train_on_batch(hmc.field_samples)
                 if rank == 0:
                     print(f"  Epoch {epoch+1}/5 | AE loss = {loss:.4e}")
 
-            # Compute curvature on last sample
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
 
             print(f"\nLatent scalar curvature (approx): {R:.4f}")
-            print("(Higher values = more curved latent manifold)")
 
             if HAS_MATPLOTLIB:
                 try:
