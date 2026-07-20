@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.5
-- --include-fermions flag
-- More conservative HMC defaults
-- Basic action diagnostics
+meta_field_distributed.py v1.6
+--include-fermions now accepts true/false
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.5")
+    print("  MetaField Distributed v1.6")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if world_size > 1 and role in ("control", "auto"):
@@ -60,8 +58,8 @@ def parse_args():
     p.add_argument("--master-addr", default="auto")
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
-    p.add_argument("--include-fermions", action="store_true", default=True,
-                   help="Include dynamical fermions (default: True)")
+    p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True,
+                   help="Include dynamical fermions (true/false)")
     return p.parse_args()
 
 
