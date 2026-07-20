@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.12
-Improved geometry layer toward information-learned representations
+meta_field_distributed.py v1.13
+Stronger geometry layer + opportunistic improvements
 """
 
 from __future__ import annotations
@@ -56,11 +56,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.12 - Stronger Geometry Layer")
+    print("  MetaField Distributed v1.13")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + IMPROVED GEOMETRY]")
+        print("   [DIAGNOSTIC + GEOMETRY v2]")
     print()
 
 
@@ -124,13 +124,6 @@ class _MLP(nn.Module):
 
 
 class LearnedInformationGeometry:
-    """
-    Improved geometry module.
-    - Better training
-    - Improved curvature estimation (averaged)
-    - Support for richer field data
-    """
-
     def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dims=(256, 128), sigma: float = 1.0, lr: float = 3e-4):
         self.latent_dim = latent_dim
         self.sigma = sigma
@@ -174,7 +167,6 @@ class LearnedInformationGeometry:
             z2d = pca.fit_transform(z.numpy())
         else:
             z2d = z[:, :2].numpy()
-        # Color by mean absolute value as a simple proxy
         colors = [float(torch.abs(s).mean()) for s in samples]
         return z2d, colors
 
@@ -183,8 +175,7 @@ class LearnedInformationGeometry:
         G = (J.T @ J) / (self.sigma ** 2)
         return G
 
-    def scalar_curvature(self, z: torch.Tensor, n_points: int = 8, eps: float = 1e-3):
-        """Improved curvature: average over several points in latent space."""
+    def scalar_curvature(self, z: torch.Tensor, n_points: int = 12, eps: float = 1e-3):
         G = self.fisher_metric(z)
         try:
             G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0], dtype=G.dtype))
@@ -192,9 +183,9 @@ class LearnedInformationGeometry:
             return float('nan')
 
         dim = self.latent_dim
-        total_curv = 0.0
+        total = 0.0
         for _ in range(n_points):
-            z_point = z + torch.randn_like(z) * 0.1
+            z_point = z + torch.randn_like(z) * 0.05
             curv = 0.0
             for i in range(dim):
                 for j in range(dim):
@@ -205,8 +196,8 @@ class LearnedInformationGeometry:
                     G_minus = self.fisher_metric(z_point - step)
                     dG = (G_plus - G_minus) / (2 * eps)
                     curv += torch.trace(G_inv @ dG)
-            total_curv += curv
-        return float(total_curv / n_points)
+            total += curv
+        return float(total / n_points)
 
 
 class DistributedLattice:
@@ -325,7 +316,7 @@ class DistributedPseudofermionField:
         self.config = config
         self.generator = generator
         self.phi = None
-        self.last_x = None   # store last CG solution for geometry
+        self.last_x = None
 
     def refresh(self, U):
         shape = self.lattice.local_padded_shape + (self.config.spinor_dim, self.config.color_dim)
@@ -333,9 +324,6 @@ class DistributedPseudofermionField:
         imag = torch.randn(shape, generator=self.generator, dtype=torch.float64, device=self.lattice.device)
         eta = (real + 1j * imag).to(self.config.dtype)
         self.phi = self.dirac.apply_dagger(eta, U)
-
-    def get_last_solution(self):
-        return self.last_x
 
 
 class DistributedHMC:
@@ -397,9 +385,14 @@ class DistributedHMC:
             lat.update_halo_gauge(self.gauge.U)
 
             if self.diagnostic and self.lattice.rank == 0:
-                # Prefer pseudofermion solution if available (richer data)
-                if self.pseudo is not None and hasattr(self.pseudo, 'last_x') and self.pseudo.last_x is not None:
-                    flat = self.pseudo.last_x.detach().flatten().real[:8192]
+                # Prefer pseudofermion solution when available
+                if self.pseudo is not None and self.pseudo.phi is not None:
+                    # Try to get a CG solution if the class supports it
+                    try:
+                        x = self.dirac.apply(self.pseudo.phi, self.gauge.U)
+                        flat = x.detach().flatten().real[:8192]
+                    except:
+                        flat = self.gauge.U.detach().flatten().real[:8192]
                 else:
                     flat = self.gauge.U.detach().flatten().real[:8192]
                 self.field_samples.append(flat)
@@ -420,7 +413,7 @@ def main():
         beta=5.5,
         hmc_n_leapfrog=20,
         hmc_step_size=0.012,
-        hmc_trajectories=25,   # more trajectories = richer dataset
+        hmc_trajectories=25,
         include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
@@ -461,24 +454,36 @@ def main():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
 
-            print(f"\nLatent scalar curvature (improved estimate): {R:.4f}")
+            print(f"\nLatent scalar curvature (improved): {R:.4f}")
 
-            # 2D Latent visualization
             if HAS_MATPLOTLIB:
                 try:
                     z2d, colors = geometry.get_latent_2d(hmc.field_samples)
                     if z2d is not None:
                         plt.figure(figsize=(7, 5))
                         scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=50, alpha=0.85)
-                        plt.colorbar(scatter, label='Mean |field| (proxy)')
-                        plt.title('2D Latent Space of Field Configurations')
-                        plt.xlabel('Latent Dim 1 (PC1)')
-                        plt.ylabel('Latent Dim 2 (PC2)')
+                        plt.colorbar(scatter, label='Mean |field|')
+                        plt.title('2D Latent Space')
                         plt.tight_layout()
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
+
+                    # Reconstruction quality plot
+                    with torch.no_grad():
+                        x = torch.stack(hmc.field_samples[:min(50, len(hmc.field_samples))]).to(torch.float64)
+                        x_hat = geometry.decoder(geometry.encoder(x))
+                        recon_error = torch.mean((x_hat - x) ** 2, dim=1)
+
+                    plt.figure(figsize=(6, 4))
+                    plt.plot(recon_error.numpy())
+                    plt.title('Reconstruction Error (per sample)')
+                    plt.xlabel('Sample index')
+                    plt.ylabel('MSE')
+                    plt.tight_layout()
+                    plt.savefig('reconstruction_error.png', dpi=120)
+                    print("Saved reconstruction_error.png")
                 except Exception as e:
-                    print(f"Latent plot error: {e}")
+                    print(f"Plot error: {e}")
 
     cleanup_distributed()
 
