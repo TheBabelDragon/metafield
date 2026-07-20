@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.18
+meta_field_distributed.py v1.19 (Final Improvements)
 
-Fixed gradient error in predictor.
-More robust episodic memory + prediction layer.
+Polished and stabilized version of the memory + prediction layer.
+This represents the strongest single-machine state of the system.
+
+Direction: Moving from "world generator" toward an agent that
+accumulates experience and forms expectations inside its own
+simulated universe.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import List, Dict, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -58,7 +62,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.18")
+    print("  MetaField Distributed v1.19 (Final Improvements)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -109,7 +113,7 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Episodic Memory ====================
+# ==================== Episodic Memory + Prioritization ====================
 
 class EpisodicExperience:
     def __init__(self, latent: torch.Tensor, action: float, delta_h: float,
@@ -121,8 +125,13 @@ class EpisodicExperience:
         self.curvature = float(curvature)
         self.priority = 1.0
 
-    def update_priority(self, extra: float = 0.0):
-        self.priority = max(0.5, 1.0 + 2.0 * self.curvature + extra)
+    def update_priority(self, prediction_error: float = 0.0):
+        # Prioritize experiences that are surprising or hard to predict
+        self.priority = max(0.5,
+                            1.0 +
+                            2.0 * abs(self.curvature) +
+                            1.5 * self.delta_h +
+                            prediction_error * 0.1)
 
 
 class EpisodicMemory:
@@ -133,7 +142,6 @@ class EpisodicMemory:
     def add(self, exp: EpisodicExperience):
         self.buffer.append(exp)
         if len(self.buffer) > self.max_size:
-            # Remove lowest priority
             self.buffer.sort(key=lambda e: e.priority)
             self.buffer.pop(0)
 
@@ -480,7 +488,7 @@ def main():
 
     memory = EpisodicMemory() if (args.diagnostic and rank == 0) else None
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
-    predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-3) if predictor is not None else None
+    predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
 
     geometry = None
 
@@ -507,25 +515,34 @@ def main():
             )
             memory.add(exp)
 
-            # Train predictor on fresh encodings (avoids detached tensor issue)
+            # Train predictor with normalized targets for stability
             if predictor is not None and len(memory.buffer) > 8:
                 batch = memory.sample(16)
-                # Re-encode recent samples for gradient flow
                 recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
                 x_batch = torch.stack(recent).to(torch.float64)
-                z_batch = geometry.encode(x_batch)   # fresh encoding with grad
+                z_batch = geometry.encode(x_batch)
 
-                target = torch.tensor([e.action for e in batch], dtype=torch.float64).unsqueeze(1)
+                # Normalize targets
+                actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
+                target_mean = actions.mean()
+                target_std = actions.std() + 1e-6
+                target = ((actions - target_mean) / target_std).unsqueeze(1)
 
                 pred = predictor(z_batch)
                 pred_loss = torch.mean((pred - target) ** 2)
 
                 predictor_optimizer.zero_grad()
                 pred_loss.backward()
+                torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                 predictor_optimizer.step()
 
+                # Update priorities
+                for e in batch:
+                    e.update_priority(float(pred_loss.item()))
+
                 if t % 5 == 0:
-                    print(f"  [Prediction] Loss = {pred_loss.item():.4e} | Memory size = {len(memory)}")
+                    avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
+                    print(f"  [Memory] size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
 
         if rank == 0:
             status = "ACCEPTED" if res["accepted"] else "REJECTED"
