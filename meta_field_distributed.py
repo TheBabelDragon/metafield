@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py
-=========================
-
-MetaField Distributed v1.4
-Improved default HMC parameters for decent acceptance on small lattices.
+meta_field_distributed.py v1.5
+- --include-fermions flag
+- More conservative HMC defaults
+- Basic action diagnostics
 """
 
 from __future__ import annotations
@@ -45,11 +44,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.4")
+    print("  MetaField Distributed v1.5")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if world_size > 1 and role in ("control", "auto"):
-        print(f"\n[CONTROL] Worker command: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size}")
+        print(f"\n[CONTROL] Worker: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size}")
     print()
 
 
@@ -61,6 +60,8 @@ def parse_args():
     p.add_argument("--master-addr", default="auto")
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
+    p.add_argument("--include-fermions", action="store_true", default=True,
+                   help="Include dynamical fermions (default: True)")
     return p.parse_args()
 
 
@@ -82,7 +83,8 @@ def init_distributed(args):
 
 
 def cleanup_distributed():
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class DistributedLattice:
@@ -223,7 +225,8 @@ class DistributedHMC:
         cfg, lat = self.config, self.lattice
         U0 = self.gauge.U.clone()
         P0 = random_su_n_hermitian(U0.shape, cfg.color_dim, cfg.dtype, U0.device, self.generator)
-        if self.pseudo: self.pseudo.refresh(U0)
+        if self.pseudo:
+            self.pseudo.refresh(U0)
 
         kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H0 = lat.global_sum(kinetic0) + self.gauge.wilson_action()
@@ -259,14 +262,13 @@ def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
 
-    # Improved defaults for better acceptance on L=4
     config = ConfigV2(
         L=4,
         beta=5.5,
-        hmc_n_leapfrog=12,
-        hmc_step_size=0.025,
-        hmc_trajectories=12,
-        include_fermions=True,
+        hmc_n_leapfrog=15,
+        hmc_step_size=0.015,
+        hmc_trajectories=10,
+        include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
         dtype=torch.complex128,
@@ -282,7 +284,7 @@ def main():
     hmc = DistributedHMC(gauge, dirac, config, gen, pseudo)
 
     if rank == 0:
-        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED"
+        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED (gauge only)"
         print(f"Starting {mode} HMC on {world_size} rank(s)...\n")
 
     for t in range(config.hmc_trajectories):
