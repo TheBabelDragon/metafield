@@ -18,13 +18,11 @@ Key friendliness features:
 
 Quick start on your two machines:
 
-# === CONTROL NODE (stronger machine, e.g. prodesk600g6) ===
+# === CONTROL NODE (Wyse) ===
 python meta_field_distributed.py --role control --world-size 2
 
-# === WORKER NODE (wyse5070) ===
-python meta_field_distributed.py --role worker --master-addr <IP-OF-CONTROL-NODE>
-
-That's it. The script will guide you.
+# === WORKER NODE (ProDesk) ===
+python meta_field_distributed.py --role worker --master-addr <WYSE-IP>
 """
 
 from __future__ import annotations
@@ -65,7 +63,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.1  —  Made friendly for your cluster")
+    print("  MetaField Distributed v1.2  —  Bugfix + User Friendly")
     print("=" * 72)
     print(f"   Role on this machine : {role.upper()}")
     print(f"   Rank / World size    : {rank} / {world_size}")
@@ -77,23 +75,15 @@ def print_banner(rank: int, world_size: int, role: str, master_addr: str, master
         local_ip = get_local_ip()
         print("\n[CONTROL] Copy-paste this on your worker node(s):")
         print(f"    python meta_field_distributed.py --role worker --master-addr {local_ip} --world-size {world_size}")
-        print("\n   Or with torchrun (better for >2 nodes):")
-        print(f"    torchrun --nnodes={world_size} --nproc_per_node=1 \\")
-        print(f"             --rdzv_id=metafield --rdzv_backend=c10d \\")
-        print(f"             --rdzv_endpoint={local_ip}:{master_port} meta_field_distributed.py")
     print()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="MetaField Distributed HMC — very beginner friendly multi-machine version",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--role", choices=["auto", "control", "worker"], default="auto",
-                        help="Role of this machine")
-    parser.add_argument("--world-size", type=int, default=2, help="Total number of machines/ranks")
-    parser.add_argument("--rank", type=int, default=None, help="Explicit rank (usually from torchrun)")
-    parser.add_argument("--master-addr", default="auto", help="IP of control node (or 'auto')")
+    parser = argparse.ArgumentParser(description="MetaField Distributed HMC - friendly multi-machine version")
+    parser.add_argument("--role", choices=["auto", "control", "worker"], default="auto")
+    parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument("--rank", type=int, default=None)
+    parser.add_argument("--master-addr", default="auto")
     parser.add_argument("--master-port", type=int, default=29500)
     parser.add_argument("--backend", default="gloo", choices=["gloo", "nccl"])
     return parser.parse_args()
@@ -108,9 +98,6 @@ def init_distributed(args: argparse.Namespace) -> Tuple[int, int, str, int]:
 
     if role == "control":
         rank = 0
-    elif role == "worker" and rank == 0:
-        print("[INFO] --role worker chosen. Make sure each worker has a unique rank if not using torchrun.")
-
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("MASTER_ADDR", master_addr)
     os.environ.setdefault("MASTER_PORT", str(master_port))
@@ -120,9 +107,7 @@ def init_distributed(args: argparse.Namespace) -> Tuple[int, int, str, int]:
         try:
             dist.init_process_group(backend=args.backend, rank=rank, world_size=world_size, init_method="env://")
         except Exception as e:
-            print(f"\n[ERROR] Could not connect to distributed group: {e}")
-            print("→ Make sure the CONTROL node is already running.")
-            print("→ Check network connectivity and firewall between the two machines.")
+            print(f"\n[ERROR] Could not connect: {e}")
             sys.exit(1)
 
     print_banner(rank, world_size, role, master_addr, master_port)
@@ -134,8 +119,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ==================== DistributedLattice & Halo Exchange ====================
-
 class DistributedLattice:
     def __init__(self, config: ConfigV2, rank: int, world_size: int):
         self.config = config
@@ -146,6 +129,8 @@ class DistributedLattice:
         self.local_L = self.L // world_size
         self.halo = 1
         self.local_padded_shape = (self.local_L + 2 * self.halo, self.L, self.L, self.L)
+        self.local_volume = self.local_L * (self.L ** 3)
+        self.global_volume = self.L ** 4
         self.left_neighbor = (rank - 1) % world_size
         self.right_neighbor = (rank + 1) % world_size
         self.device = torch.device(config.device)
@@ -178,8 +163,6 @@ class DistributedLattice:
         return s
 
 
-# ==================== Distributed Physics Classes ====================
-
 class DistributedGaugeField:
     def __init__(self, lattice: DistributedLattice, config: ConfigV2, generator):
         self.lattice = lattice
@@ -201,7 +184,8 @@ class DistributedGaugeField:
                 plaq = U_mu @ U_nu_xpm @ dagger(U_mu_xpn) @ dagger(self.U[..., nu, :, :])
                 tr = torch.diagonal(plaq, -2, -1).sum(-1).real / self.config.color_dim
                 traces.append(tr)
-        return lat.global_sum(torch.stack(traces).sum()) / lat.global_volume
+        local_sum = torch.stack(traces).sum()
+        return lat.global_sum(local_sum) / lat.global_volume
 
     def wilson_action(self):
         return self.config.beta * self.lattice.global_volume * (1.0 - self.plaquette_traces())
@@ -313,7 +297,7 @@ def main():
 
     config = ConfigV2(
         L=4, beta=5.5, hmc_n_leapfrog=8, hmc_step_size=0.04,
-        hmc_trajectories=6, include_fermions=True,
+        hmc_trajectories=4, include_fermions=True,
         seed=42 + rank, device="cpu", dtype=torch.complex128
     )
 
