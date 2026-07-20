@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.8
-Critical MD fix + enhanced diagnostics
+meta_field_distributed.py v1.9
+Core HMC working + LearnedInformationGeometry integration in diagnostic mode
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 try:
     import matplotlib.pyplot as plt
@@ -48,13 +49,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.8 - MD Fix + Diagnostics")
+    print("  MetaField Distributed v1.9  -  HMC + Learned Geometry")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC MODE ENABLED]")
-    if world_size > 1 and role in ("control", "auto"):
-        print(f"\n[CONTROL] Worker command printed above")
+        print("   [DIAGNOSTIC + GEOMETRY MODE]")
     print()
 
 
@@ -99,6 +98,86 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     if max_v == min_v: return "=" * width
     scale = (max_v - min_v) or 1.0
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
+
+
+# ==================== Learned Information Geometry ====================
+
+class _MLP(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i+1]))
+            if i < len(dims)-2:
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LearnedInformationGeometry:
+    """
+    Lightweight version of LearnedInformationGeometry that runs on rank 0.
+    Trains an autoencoder on field configurations and computes
+    Fisher metric + scalar curvature on the latent space.
+    """
+
+    def __init__(self, input_dim: int, latent_dim: int = 4, hidden_dims=(128, 64), sigma: float = 1.0, lr: float = 1e-3):
+        self.latent_dim = latent_dim
+        self.sigma = sigma
+
+        enc_dims = [input_dim, *hidden_dims, latent_dim]
+        dec_dims = [latent_dim, *reversed(hidden_dims), input_dim]
+
+        self.encoder = _MLP(enc_dims)
+        self.decoder = _MLP(dec_dims)
+
+        params = list(self.encoder.parameters()) + list(self.decoder.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr)
+        self.last_loss = None
+
+    def train_on_batch(self, samples: List[torch.Tensor]) -> float:
+        if not samples:
+            return 0.0
+        x = torch.stack(samples)
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        loss = torch.mean((x_hat - x) ** 2)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.last_loss = float(loss.item())
+        return self.last_loss
+
+    def encode(self, x: torch.Tensor):
+        return self.encoder(x)
+
+    def fisher_metric(self, z: torch.Tensor):
+        J = torch.func.jacrev(self.decoder)(z)
+        G = (J.T @ J) / (self.sigma ** 2)
+        return G
+
+    def scalar_curvature(self, z: torch.Tensor, eps: float = 1e-3):
+        G = self.fisher_metric(z)
+        try:
+            G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0]))
+        except:
+            return float('nan')
+
+        # Simple finite-difference approximation of curvature
+        dim = self.latent_dim
+        curv = 0.0
+        for i in range(dim):
+            for j in range(dim):
+                if i == j: continue
+                step = torch.zeros(dim)
+                step[i] = eps
+                G_plus = self.fisher_metric(z + step)
+                G_minus = self.fisher_metric(z - step)
+                dG = (G_plus - G_minus) / (2 * eps)
+                curv += torch.trace(G_inv @ dG)
+        return float(curv)
 
 
 class DistributedLattice:
@@ -239,6 +318,7 @@ class DistributedHMC:
         self.action_history: List[float] = []
         self.delta_h_history: List[float] = []
         self.accepted_history: List[bool] = []
+        self.field_samples: List[torch.Tensor] = []   # for geometry training
 
     def trajectory(self):
         cfg, lat = self.config, self.lattice
@@ -247,7 +327,7 @@ class DistributedHMC:
         if self.pseudo:
             self.pseudo.refresh(U0)
 
-        action0 = float(self.gauge.wilson_action(U0).real)   # use local U0
+        action0 = float(self.gauge.wilson_action(U0).real)
         kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H0 = lat.global_sum(kinetic0) + action0
 
@@ -256,18 +336,17 @@ class DistributedHMC:
 
         U, P = U0.clone(), P0.clone()
         eps = cfg.hmc_step_size
-
-        F = self.gauge.force(U)          # pass local U
+        F = self.gauge.force(U)
         P += 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
             U = expm_anti_hermitian(eps * (-1j * P)) @ U
             lat.update_halo_gauge(U)
-            F = self.gauge.force(U)      # pass local U
+            F = self.gauge.force(U)
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P += coeff * (1j * F)
 
-        action1 = float(self.gauge.wilson_action(U).real)   # use final local U
+        action1 = float(self.gauge.wilson_action(U).real)
         kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H1 = lat.global_sum(kinetic1) + action1
         delta_h = float((H1 - H0).real)
@@ -281,8 +360,13 @@ class DistributedHMC:
         self.n_total += 1
         if accepted:
             self.n_accepted += 1
-            self.gauge.U = U.clone()     # only update self.U on accept
+            self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
+
+            # Collect sample for geometry (only on rank 0)
+            if self.diagnostic and self.lattice.rank == 0:
+                flat = self.gauge.U.detach().flatten().real[:4096]  # truncate for speed
+                self.field_samples.append(flat)
 
         self.action_history.append(action1)
         self.delta_h_history.append(delta_h)
@@ -329,29 +413,36 @@ def main():
     if rank == 0:
         print("\nRun finished.")
 
-        if args.diagnostic and hmc.delta_h_history:
-            print("\n=== DIAGNOSTIC SUMMARY ===")
-            print(f"Final acceptance rate : {hmc.n_accepted / max(1, hmc.n_total):.2%}")
-            print(f"Mean |\u0394H|            : {sum(abs(d) for d in hmc.delta_h_history) / len(hmc.delta_h_history):.2f}")
-            print(f"Action changed?       : {min(hmc.action_history) != max(hmc.action_history)}")
+        # === Learned Information Geometry ===
+        if args.diagnostic and len(hmc.field_samples) > 4:
+            print("\n=== Learned Information Geometry ===")
+            input_dim = hmc.field_samples[0].shape[0]
+            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=4)
 
-            print("\n\u0394H sparkline:")
-            print(simple_sparkline([abs(d) for d in hmc.delta_h_history]))
+            # Train
+            for epoch in range(5):
+                loss = geometry.train_on_batch(hmc.field_samples)
+                if rank == 0:
+                    print(f"  Epoch {epoch+1}/5 | AE loss = {loss:.4e}")
+
+            # Compute curvature on last sample
+            with torch.no_grad():
+                z = geometry.encode(hmc.field_samples[-1])
+                R = geometry.scalar_curvature(z)
+
+            print(f"\nLatent scalar curvature (approx): {R:.4f}")
+            print("(Higher values = more curved latent manifold)")
 
             if HAS_MATPLOTLIB:
                 try:
-                    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-                    axs[0].plot(hmc.action_history, marker='.', label='Action')
-                    axs[0].set_ylabel('Wilson Action')
-                    axs[1].plot(hmc.delta_h_history, marker='o', label='\u0394H')
-                    axs[1].axhline(0, color='gray', ls='--')
-                    axs[1].set_ylabel('\u0394H')
-                    axs[2].plot([int(a) for a in hmc.accepted_history], marker='o', color='green')
-                    axs[2].set_ylabel('Accepted')
-                    axs[2].set_xlabel('Trajectory')
+                    plt.figure(figsize=(6,4))
+                    plt.plot(hmc.action_history, label='Action')
+                    plt.title('Wilson Action during HMC')
+                    plt.xlabel('Trajectory')
+                    plt.legend()
                     plt.tight_layout()
-                    plt.savefig('hmc_diagnostics.png', dpi=150)
-                    print("\nSaved hmc_diagnostics.png")
+                    plt.savefig('action_history.png', dpi=120)
+                    print("Saved action_history.png")
                 except Exception as e:
                     print(f"Plot error: {e}")
 
