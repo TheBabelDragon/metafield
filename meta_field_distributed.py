@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.13
-Stronger geometry layer + opportunistic improvements
+meta_field_distributed.py v1.14
+Best current version - stable + improved geometry
 """
 
 from __future__ import annotations
@@ -56,11 +56,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.13")
+    print("  MetaField Distributed v1.14 - Best Current Version")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + GEOMETRY v2]")
+        print("   [DIAGNOSTIC + GEOMETRY]")
     print()
 
 
@@ -107,7 +107,7 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Learned Information Geometry v2 ====================
+# ==================== Learned Information Geometry ====================
 
 class _MLP(nn.Module):
     def __init__(self, dims, dtype=torch.float64):
@@ -142,7 +142,10 @@ class LearnedInformationGeometry:
     def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 30) -> float:
         if not samples:
             return 0.0
-        x = torch.stack(samples).to(torch.float64)
+        # Safety: ensure all samples have same shape and dtype
+        x = torch.stack([s.to(torch.float64) for s in samples if s.shape[0] == samples[0].shape[0]])
+        if len(x) < 4:
+            return 0.0
         for epoch in range(epochs):
             z = self.encoder(x)
             x_hat = self.decoder(z)
@@ -159,7 +162,7 @@ class LearnedInformationGeometry:
     def get_latent_2d(self, samples: List[torch.Tensor]):
         if not samples:
             return None, None
-        x = torch.stack(samples).to(torch.float64)
+        x = torch.stack([s.to(torch.float64) for s in samples if s.shape[0] == samples[0].shape[0]])
         with torch.no_grad():
             z = self.encoder(x)
         if HAS_SKLEARN and z.shape[1] > 2:
@@ -316,7 +319,6 @@ class DistributedPseudofermionField:
         self.config = config
         self.generator = generator
         self.phi = None
-        self.last_x = None
 
     def refresh(self, U):
         shape = self.lattice.local_padded_shape + (self.config.spinor_dim, self.config.color_dim)
@@ -385,16 +387,8 @@ class DistributedHMC:
             lat.update_halo_gauge(self.gauge.U)
 
             if self.diagnostic and self.lattice.rank == 0:
-                # Prefer pseudofermion solution when available
-                if self.pseudo is not None and self.pseudo.phi is not None:
-                    # Try to get a CG solution if the class supports it
-                    try:
-                        x = self.dirac.apply(self.pseudo.phi, self.gauge.U)
-                        flat = x.detach().flatten().real[:8192]
-                    except:
-                        flat = self.gauge.U.detach().flatten().real[:8192]
-                else:
-                    flat = self.gauge.U.detach().flatten().real[:8192]
+                # Safe collection - mainly gauge fields for stability
+                flat = self.gauge.U.detach().flatten().real[:8192]
                 self.field_samples.append(flat)
 
         self.action_history.append(action1)
@@ -443,7 +437,7 @@ def main():
         print("\nRun finished.")
 
         if args.diagnostic and len(hmc.field_samples) > 10:
-            print("\n=== Learned Information Geometry v2 ===")
+            print("\n=== Learned Information Geometry ===")
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
@@ -463,21 +457,21 @@ def main():
                         plt.figure(figsize=(7, 5))
                         scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=50, alpha=0.85)
                         plt.colorbar(scatter, label='Mean |field|')
-                        plt.title('2D Latent Space')
+                        plt.title('2D Latent Space of Field Configurations')
                         plt.tight_layout()
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
 
-                    # Reconstruction quality plot
+                    # Reconstruction quality
                     with torch.no_grad():
-                        x = torch.stack(hmc.field_samples[:min(50, len(hmc.field_samples))]).to(torch.float64)
+                        x = torch.stack(hmc.field_samples[:min(64, len(hmc.field_samples))]).to(torch.float64)
                         x_hat = geometry.decoder(geometry.encoder(x))
                         recon_error = torch.mean((x_hat - x) ** 2, dim=1)
 
                     plt.figure(figsize=(6, 4))
                     plt.plot(recon_error.numpy())
-                    plt.title('Reconstruction Error (per sample)')
-                    plt.xlabel('Sample index')
+                    plt.title('Reconstruction Error per Sample')
+                    plt.xlabel('Sample')
                     plt.ylabel('MSE')
                     plt.tight_layout()
                     plt.savefig('reconstruction_error.png', dpi=120)
