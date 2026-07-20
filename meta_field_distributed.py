@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.17
+meta_field_distributed.py v1.18
 
-Upgraded memory system toward the vision of an agent growing inside
-its own simulated universe.
-
-Key improvements:
-- Episodic-style memory entries (not just isolated states)
-- Basic prioritization (surprising / informative experiences)
-- Working memory vs longer-term replay buffer
-- Foundation for replay scheduling
-
-This continues the shift from "world generator" toward
-memory + prediction + eventual agency.
+Fixed gradient error in predictor.
+More robust episodic memory + prediction layer.
 """
 
 from __future__ import annotations
@@ -67,7 +58,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.17 - Episodic Memory + Prioritization")
+    print("  MetaField Distributed v1.18")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -118,79 +109,44 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Episodic Experience Buffer ====================
+# ==================== Episodic Memory ====================
 
 class EpisodicExperience:
-    """
-    A single 'episode' or meaningful experience.
-    Stores context rather than isolated states.
-    """
-    def __init__(self,
-                 latent_start: torch.Tensor,
-                 latent_end: torch.Tensor,
-                 action: float,
-                 delta_h: float,
-                 accepted: bool,
-                 curvature: float = 0.0,
-                 reconstruction_error: float = 0.0):
-        self.latent_start = latent_start.detach().cpu().clone()
-        self.latent_end = latent_end.detach().cpu().clone()
+    def __init__(self, latent: torch.Tensor, action: float, delta_h: float,
+                 accepted: bool, curvature: float = 0.0):
+        self.latent = latent.detach().cpu().clone()
         self.action = float(action)
         self.delta_h = float(delta_h)
         self.accepted = bool(accepted)
         self.curvature = float(curvature)
-        self.reconstruction_error = float(reconstruction_error)
-        self.priority = 1.0  # default priority
+        self.priority = 1.0
 
-    def update_priority(self, prediction_error: float = 0.0):
-        # Simple prioritization: high reconstruction error, unusual curvature,
-        # or high prediction error = more important
-        self.priority = (1.0 +
-                         2.0 * self.reconstruction_error +
-                         1.5 * abs(self.curvature) +
-                         1.0 * prediction_error)
+    def update_priority(self, extra: float = 0.0):
+        self.priority = max(0.5, 1.0 + 2.0 * self.curvature + extra)
 
 
 class EpisodicMemory:
-    """
-    Memory system with working memory + longer-term prioritized replay.
-    This is the foundation for more sophisticated memory later.
-    """
-    def __init__(self, working_size: int = 32, long_term_size: int = 256):
-        self.working_memory: List[EpisodicExperience] = []
-        self.long_term_memory: List[EpisodicExperience] = []
-        self.working_size = working_size
-        self.long_term_size = long_term_size
+    def __init__(self, max_size: int = 256):
+        self.buffer: List[EpisodicExperience] = []
+        self.max_size = max_size
 
-    def add(self, experience: EpisodicExperience):
-        # Always add to working memory
-        self.working_memory.append(experience)
-        if len(self.working_memory) > self.working_size:
-            self.working_memory.pop(0)
+    def add(self, exp: EpisodicExperience):
+        self.buffer.append(exp)
+        if len(self.buffer) > self.max_size:
+            # Remove lowest priority
+            self.buffer.sort(key=lambda e: e.priority)
+            self.buffer.pop(0)
 
-        # Add to long-term memory with priority
-        self.long_term_memory.append(experience)
-        if len(self.long_term_memory) > self.long_term_size:
-            # Remove lowest priority item
-            self.long_term_memory.sort(key=lambda e: e.priority)
-            self.long_term_memory.pop(0)
-
-    def sample(self, n: int = 16, prefer_surprising: bool = True):
-        if not self.long_term_memory:
-            return []
-
-        if prefer_surprising:
-            # Prioritized sampling (higher priority = more likely)
-            priorities = torch.tensor([e.priority for e in self.long_term_memory], dtype=torch.float32)
-            probs = priorities / priorities.sum()
-            indices = torch.multinomial(probs, min(n, len(self.long_term_memory)), replacement=True)
-            return [self.long_term_memory[i] for i in indices]
-        else:
-            indices = torch.randperm(len(self.long_term_memory))[:n]
-            return [self.long_term_memory[i] for i in indices]
+    def sample(self, n: int = 16):
+        if len(self.buffer) < n:
+            return self.buffer
+        priorities = torch.tensor([e.priority for e in self.buffer], dtype=torch.float32)
+        probs = priorities / priorities.sum()
+        indices = torch.multinomial(probs, n, replacement=True)
+        return [self.buffer[i] for i in indices]
 
     def __len__(self):
-        return len(self.long_term_memory)
+        return len(self.buffer)
 
 
 # ==================== Latent Predictor ====================
@@ -522,7 +478,6 @@ def main():
     pseudo = DistributedPseudofermionField(lat, dirac, config, gen) if config.include_fermions else None
     hmc = DistributedHMC(gauge, dirac, config, gen, pseudo, diagnostic=args.diagnostic)
 
-    # Memory system
     memory = EpisodicMemory() if (args.diagnostic and rank == 0) else None
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-3) if predictor is not None else None
@@ -537,45 +492,40 @@ def main():
         res = hmc.trajectory()
 
         if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
+            if geometry is None:
+                input_dim = hmc.field_samples[0].shape[0]
+                geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
+
             with torch.no_grad():
-                if geometry is None:
-                    input_dim = hmc.field_samples[0].shape[0]
-                    geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
+                z = geometry.encode(hmc.field_samples[-1])
 
-                z_start = geometry.encode(hmc.field_samples[-1]) if len(hmc.field_samples) > 1 else torch.zeros(8)
-                z_end = geometry.encode(hmc.field_samples[-1])
+            exp = EpisodicExperience(
+                latent=z,
+                action=hmc.action_history[-1] if hmc.action_history else 0.0,
+                delta_h=res["delta_h"],
+                accepted=res["accepted"],
+            )
+            memory.add(exp)
 
-                # Create episodic experience
-                exp = EpisodicExperience(
-                    latent_start=z_start,
-                    latent_end=z_end,
-                    action=hmc.action_history[-1] if hmc.action_history else 0.0,
-                    delta_h=res["delta_h"],
-                    accepted=res["accepted"],
-                    curvature=0.0,  # will be updated later
-                )
+            # Train predictor on fresh encodings (avoids detached tensor issue)
+            if predictor is not None and len(memory.buffer) > 8:
+                batch = memory.sample(16)
+                # Re-encode recent samples for gradient flow
+                recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
+                x_batch = torch.stack(recent).to(torch.float64)
+                z_batch = geometry.encode(x_batch)   # fresh encoding with grad
 
-                memory.add(exp)
+                target = torch.tensor([e.action for e in batch], dtype=torch.float64).unsqueeze(1)
 
-                # Online prediction + priority update
-                if predictor is not None and len(memory.long_term_memory) > 8:
-                    batch = memory.sample(16)
-                    z_batch = torch.stack([e.latent_end for e in batch]).to(torch.float64)
-                    target = torch.tensor([e.action for e in batch], dtype=torch.float64).unsqueeze(1)
+                pred = predictor(z_batch)
+                pred_loss = torch.mean((pred - target) ** 2)
 
-                    pred = predictor(z_batch)
-                    pred_loss = torch.mean((pred - target) ** 2)
+                predictor_optimizer.zero_grad()
+                pred_loss.backward()
+                predictor_optimizer.step()
 
-                    predictor_optimizer.zero_grad()
-                    pred_loss.backward()
-                    predictor_optimizer.step()
-
-                    # Update priorities based on prediction error
-                    for e in batch:
-                        e.update_priority(float(pred_loss.item()))
-
-                    if t % 4 == 0:
-                        print(f"  [Memory] Buffer={len(memory)} | Pred Loss={pred_loss.item():.4e}")
+                if t % 5 == 0:
+                    print(f"  [Prediction] Loss = {pred_loss.item():.4e} | Memory size = {len(memory)}")
 
         if rank == 0:
             status = "ACCEPTED" if res["accepted"] else "REJECTED"
