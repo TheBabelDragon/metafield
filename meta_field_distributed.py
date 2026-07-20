@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.7
---diagnostic mode with history tracking and basic visualization
+meta_field_distributed.py v1.8
+Critical MD fix + enhanced diagnostics
 """
 
 from __future__ import annotations
@@ -48,13 +48,13 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.7  + Diagnostic Mode")
+    print("  MetaField Distributed v1.8 - MD Fix + Diagnostics")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
         print("   [DIAGNOSTIC MODE ENABLED]")
     if world_size > 1 and role in ("control", "auto"):
-        print(f"\n[CONTROL] Worker: python meta_field_distributed.py --role worker --master-addr {get_local_ip()} --world-size {world_size} --diagnostic")
+        print(f"\n[CONTROL] Worker command printed above")
     print()
 
 
@@ -67,7 +67,7 @@ def parse_args():
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
     p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True)
-    p.add_argument("--diagnostic", action="store_true", default=False, help="Enable diagnostic output and history tracking")
+    p.add_argument("--diagnostic", action="store_true", default=False)
     return p.parse_args()
 
 
@@ -93,14 +93,12 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def simple_sparkline(data: List[float], width: int = 40) -> str:
-    if not data:
-        return ""
+def simple_sparkline(data: List[float], width: int = 50) -> str:
+    if not data: return ""
     min_v, max_v = min(data), max(data)
-    if max_v == min_v:
-        return "=" * width
-    scale = (max_v - min_v) or 1
-    return ''.join(chr(0x2581 + int((v - min_v) / scale * 7)) for v in data[:width])
+    if max_v == min_v: return "=" * width
+    scale = (max_v - min_v) or 1.0
+    return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
 class DistributedLattice:
@@ -173,11 +171,12 @@ class DistributedGaugeField:
         if U is None: U = self.U
         return self.config.beta * self.lattice.global_volume * (1.0 - self.plaquette_traces(U))
 
-    def force(self):
-        U = self.U.detach().clone().requires_grad_(True)
-        S = self.wilson_action(U)
-        grad = torch.autograd.grad(S, U)[0]
-        return project_traceless_antihermitian(U.detach() @ dagger(grad.detach()))
+    def force(self, U=None):
+        if U is None: U = self.U
+        U_req = U.detach().clone().requires_grad_(True)
+        S = self.wilson_action(U_req)
+        grad = torch.autograd.grad(S, U_req)[0]
+        return project_traceless_antihermitian(U_req.detach() @ dagger(grad.detach()))
 
 
 class DistributedWilsonDiracOperator:
@@ -248,7 +247,7 @@ class DistributedHMC:
         if self.pseudo:
             self.pseudo.refresh(U0)
 
-        action0 = float(self.gauge.wilson_action().real)
+        action0 = float(self.gauge.wilson_action(U0).real)   # use local U0
         kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H0 = lat.global_sum(kinetic0) + action0
 
@@ -257,17 +256,18 @@ class DistributedHMC:
 
         U, P = U0.clone(), P0.clone()
         eps = cfg.hmc_step_size
-        F = self.gauge.force()
+
+        F = self.gauge.force(U)          # pass local U
         P += 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
             U = expm_anti_hermitian(eps * (-1j * P)) @ U
             lat.update_halo_gauge(U)
-            F = self.gauge.force()
+            F = self.gauge.force(U)      # pass local U
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P += coeff * (1j * F)
 
-        action1 = float(self.gauge.wilson_action().real)
+        action1 = float(self.gauge.wilson_action(U).real)   # use final local U
         kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H1 = lat.global_sum(kinetic1) + action1
         delta_h = float((H1 - H0).real)
@@ -277,11 +277,12 @@ class DistributedHMC:
 
         accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
         accepted = torch.rand((), generator=self.generator).item() < accept_prob
+
         self.n_total += 1
         if accepted:
             self.n_accepted += 1
-            self.gauge.U = U
-            lat.update_halo_gauge(U)
+            self.gauge.U = U.clone()     # only update self.U on accept
+            lat.update_halo_gauge(self.gauge.U)
 
         self.action_history.append(action1)
         self.delta_h_history.append(delta_h)
@@ -328,33 +329,31 @@ def main():
     if rank == 0:
         print("\nRun finished.")
 
-        # === Diagnostic Summary ===
         if args.diagnostic and hmc.delta_h_history:
             print("\n=== DIAGNOSTIC SUMMARY ===")
             print(f"Final acceptance rate : {hmc.n_accepted / max(1, hmc.n_total):.2%}")
             print(f"Mean |\u0394H|            : {sum(abs(d) for d in hmc.delta_h_history) / len(hmc.delta_h_history):.2f}")
-            print(f"Action range          : {min(hmc.action_history):.2f} → {max(hmc.action_history):.2f}")
+            print(f"Action changed?       : {min(hmc.action_history) != max(hmc.action_history)}")
 
-            print("\n\u0394H history (sparkline):")
+            print("\n\u0394H sparkline:")
             print(simple_sparkline([abs(d) for d in hmc.delta_h_history]))
 
             if HAS_MATPLOTLIB:
                 try:
-                    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-                    axs[0].plot(hmc.delta_h_history, marker='o', label='\u0394H')
-                    axs[0].axhline(0, color='gray', linestyle='--')
-                    axs[0].set_ylabel('\u0394H')
-                    axs[0].legend()
-                    axs[1].plot([int(a) for a in hmc.accepted_history], marker='o', color='green')
-                    axs[1].set_ylabel('Accepted (1/0)')
-                    axs[1].set_xlabel('Trajectory')
+                    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+                    axs[0].plot(hmc.action_history, marker='.', label='Action')
+                    axs[0].set_ylabel('Wilson Action')
+                    axs[1].plot(hmc.delta_h_history, marker='o', label='\u0394H')
+                    axs[1].axhline(0, color='gray', ls='--')
+                    axs[1].set_ylabel('\u0394H')
+                    axs[2].plot([int(a) for a in hmc.accepted_history], marker='o', color='green')
+                    axs[2].set_ylabel('Accepted')
+                    axs[2].set_xlabel('Trajectory')
                     plt.tight_layout()
-                    plt.savefig('hmc_diagnostics.png')
-                    print("\nSaved diagnostic plot to hmc_diagnostics.png")
+                    plt.savefig('hmc_diagnostics.png', dpi=150)
+                    print("\nSaved hmc_diagnostics.png")
                 except Exception as e:
-                    print(f"Could not save plot: {e}")
-            else:
-                print("(matplotlib not installed - skipping PNG plot)")
+                    print(f"Plot error: {e}")
 
     cleanup_distributed()
 
