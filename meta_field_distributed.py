@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.10
-Dtype fix for LearnedInformationGeometry
+meta_field_distributed.py v1.11
+Improved geometry: more samples + longer training + 2D latent visualization
 """
 
 from __future__ import annotations
@@ -16,6 +16,14 @@ from typing import Optional, Tuple, Dict, Any, List
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+try:
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    HAS_MATPLOTLIB = False
 
 try:
     import matplotlib.pyplot as plt
@@ -49,11 +57,11 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.10")
+    print("  MetaField Distributed v1.11 - Better Geometry")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + GEOMETRY MODE]")
+        print("   [DIAGNOSTIC + IMPROVED GEOMETRY]")
     print()
 
 
@@ -100,7 +108,7 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Learned Information Geometry (float64) ====================
+# ==================== Learned Information Geometry ====================
 
 class _MLP(nn.Module):
     def __init__(self, dims, dtype=torch.float64):
@@ -117,7 +125,7 @@ class _MLP(nn.Module):
 
 
 class LearnedInformationGeometry:
-    def __init__(self, input_dim: int, latent_dim: int = 4, hidden_dims=(128, 64), sigma: float = 1.0, lr: float = 1e-3):
+    def __init__(self, input_dim: int, latent_dim: int = 6, hidden_dims=(256, 128), sigma: float = 1.0, lr: float = 5e-4):
         self.latent_dim = latent_dim
         self.sigma = sigma
         dtype = torch.float64
@@ -132,21 +140,35 @@ class LearnedInformationGeometry:
         self.optimizer = torch.optim.Adam(params, lr=lr)
         self.last_loss = None
 
-    def train_on_batch(self, samples: List[torch.Tensor]) -> float:
+    def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 25) -> float:
         if not samples:
             return 0.0
         x = torch.stack(samples).to(torch.float64)
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        loss = torch.mean((x_hat - x) ** 2)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.last_loss = float(loss.item())
+        for epoch in range(epochs):
+            z = self.encoder(x)
+            x_hat = self.decoder(z)
+            loss = torch.mean((x_hat - x) ** 2)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            self.last_loss = float(loss.item())
         return self.last_loss
 
     def encode(self, x: torch.Tensor):
         return self.encoder(x.to(torch.float64))
+
+    def get_latent_2d(self, samples: List[torch.Tensor]):
+        if not samples:
+            return None, None
+        x = torch.stack(samples).to(torch.float64)
+        with torch.no_grad():
+            z = self.encoder(x)
+        if HAS_SKLEARN and z.shape[1] > 2:
+            pca = PCA(n_components=2)
+            z2d = pca.fit_transform(z.numpy())
+        else:
+            z2d = z[:, :2].numpy()
+        return z2d, [float(s.mean()) for s in samples]  # color by mean action proxy
 
     def fisher_metric(self, z: torch.Tensor):
         J = torch.func.jacrev(self.decoder)(z)
@@ -357,7 +379,7 @@ class DistributedHMC:
             lat.update_halo_gauge(self.gauge.U)
 
             if self.diagnostic and self.lattice.rank == 0:
-                flat = self.gauge.U.detach().flatten().real[:4096]
+                flat = self.gauge.U.detach().flatten().real[:8192]
                 self.field_samples.append(flat)
 
         self.action_history.append(action1)
@@ -376,7 +398,7 @@ def main():
         beta=5.5,
         hmc_n_leapfrog=20,
         hmc_step_size=0.012,
-        hmc_trajectories=12,
+        hmc_trajectories=20,   # more trajectories = more samples
         include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
@@ -405,34 +427,36 @@ def main():
     if rank == 0:
         print("\nRun finished.")
 
-        if args.diagnostic and len(hmc.field_samples) > 4:
-            print("\n=== Learned Information Geometry ===")
+        if args.diagnostic and len(hmc.field_samples) > 8:
+            print("\n=== Learned Information Geometry (Improved) ===")
             input_dim = hmc.field_samples[0].shape[0]
-            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=4)
+            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=6)
 
-            for epoch in range(5):
-                loss = geometry.train_on_batch(hmc.field_samples)
-                if rank == 0:
-                    print(f"  Epoch {epoch+1}/5 | AE loss = {loss:.4e}")
+            loss = geometry.train_on_batch(hmc.field_samples, epochs=25)
+            print(f"Final AE loss after 25 epochs: {loss:.4e}")
 
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
 
-            print(f"\nLatent scalar curvature (approx): {R:.4f}")
+            print(f"Latent scalar curvature (approx): {R:.4f}")
 
+            # 2D Latent visualization
             if HAS_MATPLOTLIB:
                 try:
-                    plt.figure(figsize=(6,4))
-                    plt.plot(hmc.action_history, label='Action')
-                    plt.title('Wilson Action during HMC')
-                    plt.xlabel('Trajectory')
-                    plt.legend()
-                    plt.tight_layout()
-                    plt.savefig('action_history.png', dpi=120)
-                    print("Saved action_history.png")
+                    z2d, colors = geometry.get_latent_2d(hmc.field_samples)
+                    if z2d is not None:
+                        plt.figure(figsize=(7, 5))
+                        scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=60, alpha=0.8)
+                        plt.colorbar(scatter, label='Mean field value (proxy)')
+                        plt.title('2D Latent Space of Gauge Configurations')
+                        plt.xlabel('PC1 / Latent dim 1')
+                        plt.ylabel('PC2 / Latent dim 2')
+                        plt.tight_layout()
+                        plt.savefig('latent_space.png', dpi=150)
+                        print("Saved latent_space.png")
                 except Exception as e:
-                    print(f"Plot error: {e}")
+                    print(f"Latent plot error: {e}")
 
     cleanup_distributed()
 
