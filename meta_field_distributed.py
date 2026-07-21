@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.31
+meta_field_distributed.py v1.32
 
-Major hybrid modularity milestone:
-- memory.py, prediction.py, geometry.py, config.py extracted
-- Main file is now much cleaner and focused on orchestration + HMC
+Improved continuous mode with periodic system summaries.
+Better long-run observability and reduced noise.
 """
 
 from __future__ import annotations
@@ -30,8 +29,6 @@ except ImportError:
 from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
 from geometry import LearnedInformationGeometry
-
-# from config import MetaFieldConfig   # ready for future use
 
 
 from meta_field_sim_torch import (
@@ -72,7 +69,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.31 (Modular Hybrid Foundations)")
+    print("  MetaField Distributed v1.32 (Continuous Mode Improvements)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -397,6 +394,8 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
+    last_summary = 0
+    SUMMARY_INTERVAL = 50   # Print high-level summary every N trajectories
 
     try:
         for t in range(config.hmc_trajectories):
@@ -437,9 +436,29 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                    if args.continuous:
-                        stats = memory.get_stats()
-                        print(f"  [Memory] trajectories={t} | size={stats['size']} | PredLoss={pred_loss.item():.2e} | AvgPriority={stats['avg_priority']:.2f}")
+                # Periodic high-level system summary (continuous mode)
+                if args.continuous and t > 0 and t % SUMMARY_INTERVAL == 0:
+                    mem_stats = memory.get_stats() if memory else {}
+                    recent_pred_loss = None
+                    if predictor is not None and len(memory.buffer) > 8:
+                        # Quick forward pass for current prediction loss
+                        recent = hmc.field_samples[-min(8, len(hmc.field_samples)):]
+                        x_batch = torch.stack(recent).to(torch.float64)
+                        z_batch = geometry.encode(x_batch)
+                        actions = torch.tensor([e.action for e in memory.sample(8)], dtype=torch.float64)
+                        target_mean = actions.mean()
+                        target_std = actions.std() + 1e-6
+                        target = ((actions - target_mean) / target_std).unsqueeze(1)
+                        with torch.no_grad():
+                            pred = predictor(z_batch)
+                            recent_pred_loss = torch.mean((pred - target) ** 2).item()
+
+                    print(f"\n=== System Summary @ trajectory {t} ===")
+                    print(f"  Memory size     : {mem_stats.get('size', 0)}")
+                    print(f"  Avg priority    : {mem_stats.get('avg_priority', 0):.2f}")
+                    if recent_pred_loss is not None:
+                        print(f"  Recent pred loss: {recent_pred_loss:.2e}")
+                    print(f"=====================================\n")
 
             if rank == 0:
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
