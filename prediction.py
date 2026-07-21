@@ -2,8 +2,10 @@
 """
 prediction.py
 
-LatentPredictor for MetaField.
-Designed to be modular for future Aurora integration.
+Latent space predictor.
+
+Designed to be simple, swappable, and easy to integrate
+as part of a larger Aurora mod or sensing system.
 """
 
 import torch
@@ -12,8 +14,10 @@ import torch.nn as nn
 
 class LatentPredictor(nn.Module):
     """
-    Simple feedforward predictor from latent space to scalar value.
-    Currently predicts action values, but designed to be extensible.
+    Predicts a scalar value from a latent vector.
+
+    Currently used to predict action values from latent field representations,
+    but the architecture is intentionally simple and extensible.
     """
 
     def __init__(self, latent_dim: int = 8, hidden_dim: int = 64):
@@ -24,5 +28,5 @@ class LatentPredictor(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
