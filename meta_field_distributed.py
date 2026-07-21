@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.32
+meta_field_distributed.py v1.33
 
-Improved continuous mode with periodic system summaries.
-Better long-run observability and reduced noise.
+Enhanced continuous mode system summaries with health signal.
 """
 
 from __future__ import annotations
@@ -69,7 +68,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.32 (Continuous Mode Improvements)")
+    print("  MetaField Distributed v1.33")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -394,8 +393,7 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
-    last_summary = 0
-    SUMMARY_INTERVAL = 50   # Print high-level summary every N trajectories
+    SUMMARY_INTERVAL = 50
 
     try:
         for t in range(config.hmc_trajectories):
@@ -436,12 +434,12 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                # Periodic high-level system summary (continuous mode)
+                # Enhanced periodic system summary
                 if args.continuous and t > 0 and t % SUMMARY_INTERVAL == 0:
-                    mem_stats = memory.get_stats() if memory else {}
+                    mem_stats = memory.get_stats()
                     recent_pred_loss = None
+
                     if predictor is not None and len(memory.buffer) > 8:
-                        # Quick forward pass for current prediction loss
                         recent = hmc.field_samples[-min(8, len(hmc.field_samples)):]
                         x_batch = torch.stack(recent).to(torch.float64)
                         z_batch = geometry.encode(x_batch)
@@ -453,12 +451,18 @@ def main():
                             pred = predictor(z_batch)
                             recent_pred_loss = torch.mean((pred - target) ** 2).item()
 
-                    print(f"\n=== System Summary @ trajectory {t} ===")
-                    print(f"  Memory size     : {mem_stats.get('size', 0)}")
-                    print(f"  Avg priority    : {mem_stats.get('avg_priority', 0):.2f}")
+                    # Simple health signal
+                    health = "Good"
+                    if recent_pred_loss is not None and recent_pred_loss > 0.1:
+                        health = "Warning (high pred loss)"
+                    elif mem_stats.get('size', 0) < 20:
+                        health = "Building memory..."
+
+                    print(f"\n[Summary @ {t}] Health: {health} | Mem: {mem_stats.get('size', 0)} | AvgPrio: {mem_stats.get('avg_priority', 0):.2f}", end="")
                     if recent_pred_loss is not None:
-                        print(f"  Recent pred loss: {recent_pred_loss:.2e}")
-                    print(f"=====================================\n")
+                        print(f" | PredLoss: {recent_pred_loss:.2e}")
+                    else:
+                        print()
 
             if rank == 0:
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
