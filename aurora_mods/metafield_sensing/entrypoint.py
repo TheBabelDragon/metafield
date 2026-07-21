@@ -2,73 +2,90 @@
 """
 metafield_sensing / entrypoint.py
 
-Initial skeleton for a MetaField sensing mod in Aurora.
+MetaField sensing integration mod for Aurora Swarm (initial implementation).
 
-Purpose:
-- Periodically collect stats from a running MetaField instance
-  (memory size, prediction loss, curvature signals, etc.)
-- Expose them through Aurora's sensing / monitoring system
+Responsibilities:
+- Periodically collect useful signals from a running MetaField instance
+- Publish them into Aurora's sensing / monitoring layer
+- Provide a foundation for deeper integration (task scheduling, curvature-aware allocation, etc.)
 
-This is a minimal starting point. It will evolve to support:
-- richer telemetry
-- task scheduling of MetaField workloads
-- curvature-aware compute allocation
+Connection options (to be decided):
+1. Import MetaField modules directly (if running in same process)
+2. Read from shared memory / file / Redis
+3. Expose a small HTTP/gRPC endpoint from MetaField
+
+This file follows Aurora's expected mod structure.
 """
 
-# Example of how Aurora mods typically register hooks.
-# The exact API will depend on Aurora's hook_registry, but the pattern is usually:
-#
-# from scheduler.hook_registry import register_hook
-#
-# def on_sensing_tick(context):
-#     # Pull stats from MetaField (via shared memory, API, or file)
-#     stats = get_metafield_stats()
-#     context.sensing.publish("metafield", stats)
-#
-# def register():
-#     register_hook("on_sensing_tick", on_sensing_tick)
-#     register_hook("on_node_status", on_node_status)
-#
-# if __name__ == "__main__":
-#     register()
+from typing import Dict, Any
 
 
-def get_metafield_stats():
+def get_metafield_stats() -> Dict[str, Any]:
     """
-    Placeholder function.
-    In a real implementation this would read from a running MetaField
-    process (via shared memory, Redis, file, or direct import if co-located).
+    Collect current stats from a running MetaField instance.
+
+    In a real deployment this would connect to MetaField via one of the
+    methods listed above. For now it returns placeholder data.
     """
+    # TODO: Replace with real connection to MetaField
     return {
-        "memory_size": 0,
-        "avg_priority": 0.0,
-        "prediction_loss": None,
-        "geometry_loss": None,
+        "memory": {
+            "size": 0,
+            "avg_priority": 0.0,
+            "max_priority": 0.0,
+        },
+        "prediction": {
+            "recent_loss": None,
+        },
+        "geometry": {
+            "last_loss": None,
+            "latent_dim": 8,
+        },
+        "health": "unknown",
     }
 
 
-def on_sensing_tick(context):
-    """Called periodically by Aurora's sensing system."""
+def on_sensing_tick(context: Any) -> None:
+    """
+    Called periodically by Aurora's sensing system.
+
+    This is the main hook for publishing MetaField telemetry.
+    """
     stats = get_metafield_stats()
-    # TODO: Publish stats into Aurora's sensing layer
-    print(f"[metafield_sensing] Tick - stats: {stats}")
+
+    # Example of publishing into Aurora's sensing layer
+    # (exact method depends on Aurora's sensing API)
+    try:
+        context.sensing.publish("metafield", stats)
+    except Exception:
+        # Fallback for early development
+        print(f"[metafield_sensing] Sensing tick - stats: {stats}")
 
 
-def on_node_status(context):
-    """Optional hook for node-level status updates."""
+def on_node_status(context: Any) -> None:
+    """
+    Optional hook for reacting to node-level status changes.
+    Could be used later to adjust MetaField behavior based on node conditions.
+    """
     pass
 
 
-def register():
+def register() -> None:
     """
     Register this mod's hooks with Aurora.
-    This function would normally be called by Aurora's mod loader.
+
+    This function is typically called by Aurora's mod loader
+    when the mod is enabled.
     """
-    # Example (pseudo-code):
+    print("[metafield_sensing] Registering hooks...")
+
+    # Pseudo-code for actual registration (once we have Aurora's API):
+    #
     # from scheduler.hook_registry import register_hook
     # register_hook("on_sensing_tick", on_sensing_tick)
     # register_hook("on_node_status", on_node_status)
-    print("[metafield_sensing] Mod registered (skeleton)")
+
+    print("[metafield_sensing] Hooks registered (skeleton mode)")
 
 
 if __name__ == "__main__":

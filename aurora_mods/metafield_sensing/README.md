@@ -1,33 +1,50 @@
 # metafield_sensing
 
-Initial proposal for a MetaField sensing integration mod for Aurora Swarm.
+MetaField sensing integration mod for Aurora Swarm.
 
-## Goal
+## Purpose
 
-Expose useful signals from a running MetaField instance into Aurora’s sensing and monitoring layer.
+Expose useful internal signals from MetaField into Aurora's sensing and monitoring systems.
 
 Initial signals:
-- Episodic memory size and priority distribution
-- Recent prediction loss
-- Geometry (autoencoder) loss
-- Later: curvature / interesting configuration signals
+- Episodic memory statistics (size, priority distribution)
+- Prediction loss
+- Geometry / autoencoder loss
+- Later: curvature and "interesting configuration" signals
 
-## Why This First?
+## Why Start With Sensing?
 
-This is a low-risk, high-value first integration:
-- Gives immediate observability of MetaField workloads inside Aurora
-- Does not require scheduling or modifying core Aurora behavior yet
-- Builds the foundation for deeper integration later (task scheduling, curvature-aware allocation, etc.)
+This is the lowest-risk, highest-value first integration:
+- Immediate value: Aurora operators can see what MetaField is doing
+- Does not require modifying Aurora's core scheduling logic yet
+- Builds the data foundation needed for smarter integrations later
 
-## Next Steps (Proposed)
+## Current Status
 
-1. Flesh out `get_metafield_stats()` to actually read from a running MetaField process.
-2. Integrate with Aurora’s real sensing / hook system once we have access to the Aurora codebase.
-3. Expand to support scheduling MetaField continuous runs as Aurora tasks.
-4. Add curvature / interestingness signals so Aurora can prioritize interesting physics regions.
+This is an **early implementation / proposal**.
 
-## Status
+The structure follows Aurora's mod conventions (`manifest.json` + `entrypoint.py` + hooks).
 
-This is currently a **skeleton / proposal**. The structure follows Aurora’s documented mod conventions.
+`get_metafield_stats()` currently returns placeholder data. The next step is to implement a real connection to a running MetaField process.
 
-We can iterate on this together before moving it into the main Aurora repository.
+## Proposed Evolution
+
+1. **v0.1** (current) — Basic sensing hook + placeholder stats
+2. **v0.2** — Real connection to MetaField (shared memory / file / API)
+3. **v0.3** — Richer signals (curvature, reconstruction quality, memory priority distribution)
+4. **v0.4+** — Move beyond sensing into task scheduling and curvature-aware compute allocation
+
+## Integration Notes
+
+- This mod is intentionally read-only at first (sensing only).
+- Future versions can register additional hooks or task types to allow Aurora to schedule MetaField workloads.
+
+## Next Immediate Work
+
+- Decide on the best way for this mod to read live data from MetaField
+- Implement real `get_metafield_stats()`
+- Test hook registration once we have access to Aurora's runtime
+
+---
+
+*Part of the MetaField + Aurora super hybrid effort.*
