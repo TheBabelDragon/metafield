@@ -11,33 +11,30 @@ MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge th
 - Stable Hybrid Monte Carlo (HMC) with high acceptance rates
 - Wilson gauge action + Wilson-Dirac operator
 - Learned Information Geometry (autoencoder + Fisher metric + curvature estimation)
-- Episodic memory with prioritized replay
+- Episodic memory with prioritized replay + `get_stats()` for observability
 - Latent predictor that forms expectations about future behavior
-- Dynamic geometry training (number of epochs scales with the amount of data collected)
-- Efficient continuous mode (`--continuous`) with reduced predictor update frequency
+- Dynamic geometry training (epochs scale with data volume)
+- Efficient continuous mode (`--continuous`) with configurable system summaries
 
 ---
 
-## Long-term Vision: The Aurora + MetaField Super Hybrid
+## Aurora + MetaField Super Hybrid (In Progress)
 
-We are building toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc) — turning Aurora’s distributed swarm infrastructure into the coordination and community compute layer for MetaField.
+We have begun building toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc).
 
-### What the Hybrid Enables
+Aurora provides the distributed swarm infrastructure (node coordination, scheduling, community compute, and a clean mod/hook system). MetaField provides the physics simulation + growing intelligence layer (memory, prediction, geometry).
 
-Instead of treating distributed compute as a dumb resource pool, the hybrid treats the **swarm itself as an environment** in which intelligence can grow:
+### Current Integration Work
 
-- Aurora handles node discovery, scheduling, communication, resilience, and community compute across many machines.
-- MetaField provides the physics simulation (lattice QCD), learned geometry, episodic memory, and prediction systems.
-- Over time, MetaField’s internal signals (curvature, prediction difficulty, interesting configurations) can influence how Aurora allocates compute.
-- The result is a distributed system that runs physics as its native substrate and gradually develops memory, expectations, curiosity, and eventually agency.
+- Created `aurora_mods/metafield_sensing/` — a proposed first mod that exposes MetaField memory, prediction, and geometry signals into Aurora’s sensing layer.
+- MetaField core components (`memory.py`, `prediction.py`, `geometry.py`) have been extracted and cleaned up for easier integration.
+- Strong emphasis on observability (`get_stats()`, periodic summaries) to support future Aurora sensing.
 
-This is not "MetaField running on Aurora" or "Aurora with some physics mods." It is a true co-evolution where the swarm infrastructure and the physics-based intelligence layer strengthen each other.
-
-See `HYBRID_VISION.md` and `INTEGRATION_PLAN.md` for the detailed architecture and phased roadmap.
+See `aurora_mods/metafield_sensing/` for the current proposal and `INTEGRATION_PLAN.md` + `HYBRID_VISION.md` for the broader roadmap.
 
 ---
 
-## Quick Start (Single Machine)
+## Quick Start
 
 ```bash
 git clone https://github.com/TheBabelDragon/metafield.git
@@ -47,19 +44,20 @@ python -m venv ../.venv
 source ../.venv/bin/activate
 pip install torch matplotlib scikit-learn
 
-# Recommended for development
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous
+# Recommended
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
 ```
 
-Press `Ctrl+C` to stop cleanly. Long-running sessions are well supported.
+Press `Ctrl+C` to stop cleanly.
 
 ---
 
-## Key Improvements (Recent)
+## Key Recent Improvements
 
-- Geometry training epochs now scale dynamically with the number of samples collected
-- Predictor training frequency reduced in continuous mode for better performance during long runs
-- Cleaner, less noisy logging in continuous mode
+- System summary interval is now configurable via `--summary-interval`
+- Periodic high-level health + memory + prediction summaries in continuous mode
+- Major modularization (memory, prediction, and geometry extracted to their own files)
+- Aurora integration work started (`metafield_sensing` mod proposal)
 
 ---
 
@@ -68,25 +66,25 @@ Press `Ctrl+C` to stop cleanly. Long-running sessions are well supported.
 | Component                    | Description                                           |
 |-----------------------------|-------------------------------------------------------|
 | `DistributedHMC`            | Core Hybrid Monte Carlo engine                        |
-| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on field configurations |
-| `EpisodicMemory`            | Stores contextual experiences with prioritization     |
-| `LatentPredictor`           | Learns to predict future observables from latent state|
+| `EpisodicMemory`            | Prioritized episodic memory with `get_stats()`        |
+| `LatentPredictor`           | Predicts future values from latent representations    |
+| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on fields           |
 
 ---
 
-## Continuous Mode
+## Continuous Mode (Recommended)
 
 ```bash
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
 ```
 
-This is currently the recommended way to run MetaField. The system is designed for extended sessions where memory and prediction can meaningfully develop.
+Long-running sessions are well supported and now include periodic system summaries.
 
 ---
 
 ## Multi-Machine
 
-Multi-machine support exists but remains fragile due to Gloo + common Linux hostname resolution issues (`127.0.1.1` in `/etc/hosts`). The code prints clear guidance when this problem is detected.
+Multi-machine support exists but is still sensitive to system configuration (common `127.0.1.1` hostname issue). The code prints clear guidance when this problem is detected.
 
 ---
 
@@ -94,7 +92,7 @@ Multi-machine support exists but remains fragile due to Gloo + common Linux host
 
 - Python 3.10+
 - PyTorch 2.0+
-- matplotlib + scikit-learn (for visualizations and geometry)
+- matplotlib + scikit-learn
 
 ## License
 
