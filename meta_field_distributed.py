@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.29
+meta_field_distributed.py v1.30
 
-Hybrid vision implementation work begins:
-- Improved modularity of memory and predictor
-- Added basic observability (memory stats)
-- Continued continuous mode improvements
+Hybrid implementation progress:
+- EpisodicMemory extracted to memory.py
+- Continued focus on modularity for future Aurora integration
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import List, Dict, Any
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -33,6 +32,9 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+
+# Hybrid modular imports
+from memory import EpisodicMemory, EpisodicExperience
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -72,7 +74,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.29 (Hybrid Foundations)")
+    print("  MetaField Distributed v1.30 (Hybrid Modularity)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -161,67 +163,9 @@ def simple_sparkline(data: List[float], width: int = 50) -> str:
     return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
-# ==================== Episodic Memory (Improved Modularity) ====================
-
-class EpisodicExperience:
-    def __init__(self, latent: torch.Tensor, action: float, delta_h: float,
-                 accepted: bool, curvature: float = 0.0):
-        self.latent = latent.detach().cpu().clone()
-        self.action = float(action)
-        self.delta_h = float(delta_h)
-        self.accepted = bool(accepted)
-        self.curvature = float(curvature)
-        self.priority = 1.0
-
-    def update_priority(self, prediction_error: float = 0.0):
-        self.priority = max(0.5,
-                            1.0 +
-                            2.0 * abs(self.curvature) +
-                            1.5 * self.delta_h +
-                            prediction_error * 0.1)
-
-
-class EpisodicMemory:
-    """Episodic memory with prioritization. Designed to be modular for future Aurora integration."""
-
-    def __init__(self, max_size: int = 256):
-        self.buffer: List[EpisodicExperience] = []
-        self.max_size = max_size
-
-    def add(self, exp: EpisodicExperience):
-        self.buffer.append(exp)
-        if len(self.buffer) > self.max_size:
-            self.buffer.sort(key=lambda e: e.priority)
-            self.buffer.pop(0)
-
-    def sample(self, n: int = 16):
-        if len(self.buffer) < n:
-            return self.buffer
-        priorities = torch.tensor([e.priority for e in self.buffer], dtype=torch.float32)
-        probs = priorities / priorities.sum()
-        indices = torch.multinomial(probs, n, replacement=True)
-        return [self.buffer[i] for i in indices]
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Return basic observability stats (useful for future Aurora sensing)."""
-        if not self.buffer:
-            return {"size": 0, "avg_priority": 0.0, "max_priority": 0.0}
-        priorities = [e.priority for e in self.buffer]
-        return {
-            "size": len(self.buffer),
-            "avg_priority": sum(priorities) / len(priorities),
-            "max_priority": max(priorities),
-        }
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ==================== Latent Predictor (Improved Modularity) ====================
+# ==================== Latent Predictor ====================
 
 class LatentPredictor(nn.Module):
-    """Simple latent predictor. Designed to be swappable/extensible for hybrid integration."""
-
     def __init__(self, latent_dim: int = 8, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
