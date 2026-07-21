@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1., dynamic geometry training
+meta_field_distributed.py v1.27
 
-Geometry training epochs now scale dynamically with the amount of
-data collected. Much better for long continuous runs.
+Optimized predictor training frequency in continuous mode.
+Dynamic geometry training epochs now correctly scale with data.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.26 (Dynamic Geometry Training)")
+    print("  MetaField Distributed v1.27")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -96,8 +96,7 @@ def parse_args():
             return False
         return True
 
-    p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True,
-                   help="Include fermions (default: true)")
+    p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True)
 
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
@@ -479,7 +478,7 @@ class DistributedHMC:
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P += coeff * (1j * F)
 
-        action1 = float(self.gauge.wilson_action(U).real)
+        action1 = float(self.gauge.wilson_action(U).real()
         kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H1 = lat.global_sum(kinetic1) + action1
         delta_h = float((H1 - H0).real)
@@ -570,7 +569,8 @@ def main():
                 )
                 memory.add(exp)
 
-                if predictor is not None and len(memory.buffer) > 8:
+                # Optimized: Train predictor less frequently in continuous mode
+                if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(16)
                     recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
@@ -589,7 +589,7 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                    if args.continuous and t % 10 == 0:
+                    if args.continuous:
                         avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
                         print(f"  [Memory] trajectories={t} | size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
 
