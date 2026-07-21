@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.23
+meta_field_distributed.py v1.24
 
-Much stronger error handling and diagnostics for the common
-127.0.1.1 hostname issue that breaks Gloo on many Linux machines.
+Improved continuous mode + memory/prediction diagnostics.
+Foundation improvements toward the Aurora + MetaField super hybrid.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.23")
+    print("  MetaField Distributed v1.24")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -111,7 +111,6 @@ def init_distributed(args):
 
     master_port = args.master_port
 
-    # Strong guard for multi-machine
     if world_size > 1:
         if master_addr.startswith("127."):
             print("\n[CRITICAL ERROR] Your system is resolving to localhost (127.0.0.1 or 127.0.1.1).")
@@ -549,6 +548,7 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
+    last_summary = 0
 
     try:
         for t in range(config.hmc_trajectories):
@@ -592,9 +592,10 @@ def main():
                     for e in batch:
                         e.update_priority(float(pred_loss.item()))
 
-                    if t % 5 == 0:
+                    # Improved continuous mode logging
+                    if args.continuous and t % 10 == 0:
                         avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
-                        print(f"  [Memory] size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
+                        print(f"  [Memory] trajectories={t} | size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
 
             if rank == 0:
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
