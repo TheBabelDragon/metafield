@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.21
+meta_field_distributed.py v1.22
 
-Improved distributed initialization for reliable multi-machine runs.
-Cleaned up control vs worker logic.
+Fixed localhost IP resolution bug that was breaking multi-machine runs.
+Now properly detects real LAN IP and gives clear errors/instructions.
 """
 
 from __future__ import annotations
@@ -45,20 +45,36 @@ from meta_field_sim_torch import (
 )
 
 
-def get_local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def get_real_lan_ip() -> str:
+    """Try hard to get a real non-loopback LAN IP."""
     try:
+        # Try hostname first
+        hostname = socket.gethostname()
+        addrinfo = socket.getaddrinfo(hostname, None)
+        for info in addrinfo:
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                return ip
+    except:
+        pass
+
+    # Fallback: connect to external and see what interface we use
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
+        ip = s.getsockname()[0]
         s.close()
+        if not ip.startswith("127."):
+            return ip
+    except:
+        pass
+
+    return "127.0.0.1"
 
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.21")
+    print("  MetaField Distributed v1.22")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -84,8 +100,6 @@ def parse_args():
 def init_distributed(args):
     role = args.role
     world_size = args.world_size
-    master_addr = args.master_addr if args.master_addr != "auto" else get_local_ip()
-    master_port = args.master_port
 
     if role == "control":
         rank = 0
@@ -94,13 +108,29 @@ def init_distributed(args):
     else:
         rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
 
+    # Get master address
+    if args.master_addr != "auto":
+        master_addr = args.master_addr
+    else:
+        master_addr = get_real_lan_ip()
+
+    master_port = args.master_port
+
+    # Safety check for multi-machine
+    if world_size > 1 and master_addr.startswith("127."):
+        print("\n[ERROR] Could not determine your real LAN IP address.")
+        print("Please run with --master-addr set to this machine's actual IP.")
+        print("Example on control node:")
+        print("  python meta_field_distributed.py --role control --world-size 2 --master-addr 192.168.1.105 --continuous --diagnostic\n")
+        sys.exit(1)
+
     os.environ.setdefault("MASTER_ADDR", master_addr)
     os.environ.setdefault("MASTER_PORT", str(master_port))
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ["RANK"] = str(rank)
 
     if world_size > 1:
-        print(f"[Distributed] Initializing process group... (role={role}, rank={rank}, world_size={world_size})")
+        print(f"[Distributed] Initializing process group... (role={role}, rank={rank}, world_size={world_size}, master={master_addr})")
         try:
             dist.init_process_group(
                 backend=args.backend,
