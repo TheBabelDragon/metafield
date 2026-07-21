@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.24
+meta_field_distributed.py v1.25
 
-Improved continuous mode + memory/prediction diagnostics.
-Foundation improvements toward the Aurora + MetaField super hybrid.
+More forgiving argument parsing + continued improvements to
+continuous mode and memory/prediction diagnostics.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.24")
+    print("  MetaField Distributed v1.25")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -86,7 +86,20 @@ def parse_args():
     p.add_argument("--master-addr", default="auto")
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
-    p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True)
+
+    # More forgiving boolean argument
+    def parse_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('true', '1', 'yes', 'y'):
+            return True
+        if v.lower() in ('false', '0', 'no', 'n'):
+            return False
+        return True  # default to True if unclear
+
+    p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True,
+                   help="Include fermions (default: true). Accepts true/false, 1/0, yes/no")
+
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
     p.add_argument("--continuous", action="store_true", default=False)
@@ -548,7 +561,6 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
-    last_summary = 0
 
     try:
         for t in range(config.hmc_trajectories):
@@ -589,10 +601,6 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                    for e in batch:
-                        e.update_priority(float(pred_loss.item()))
-
-                    # Improved continuous mode logging
                     if args.continuous and t % 10 == 0:
                         avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
                         print(f"  [Memory] trajectories={t} | size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
