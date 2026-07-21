@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.33
+meta_field_distributed.py v1.34
 
-Enhanced continuous mode system summaries with health signal.
+Final night improvements:
+- Made system summary interval configurable (--summary-interval)
+- Continued hybrid readiness
 """
 
 from __future__ import annotations
@@ -68,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.33")
+    print("  MetaField Distributed v1.34")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -95,10 +97,11 @@ def parse_args():
         return True
 
     p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True)
-
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
     p.add_argument("--continuous", action="store_true", default=False)
+    p.add_argument("--summary-interval", type=int, default=50,
+                   help="How often to print system summary in continuous mode (default: 50)")
     return p.parse_args()
 
 
@@ -393,7 +396,7 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
-    SUMMARY_INTERVAL = 50
+    summary_interval = args.summary_interval
 
     try:
         for t in range(config.hmc_trajectories):
@@ -434,8 +437,8 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                # Enhanced periodic system summary
-                if args.continuous and t > 0 and t % SUMMARY_INTERVAL == 0:
+                # Configurable periodic system summary
+                if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
                     recent_pred_loss = None
 
@@ -451,14 +454,13 @@ def main():
                             pred = predictor(z_batch)
                             recent_pred_loss = torch.mean((pred - target) ** 2).item()
 
-                    # Simple health signal
                     health = "Good"
                     if recent_pred_loss is not None and recent_pred_loss > 0.1:
                         health = "Warning (high pred loss)"
                     elif mem_stats.get('size', 0) < 20:
                         health = "Building memory..."
 
-                    print(f"\n[Summary @ {t}] Health: {health} | Mem: {mem_stats.get('size', 0)} | AvgPrio: {mem_stats.get('avg_priority', 0):.2f}", end="")
+                    print(f"[Summary @ {t}] Health: {health} | Mem: {mem_stats.get('size', 0)} | AvgPrio: {mem_stats.get('avg_priority', 0):.2f}", end="")
                     if recent_pred_loss is not None:
                         print(f" | PredLoss: {recent_pred_loss:.2e}")
                     else:
