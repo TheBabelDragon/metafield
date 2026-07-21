@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.25
+meta_field_distributed.py v1., dynamic geometry training
 
-More forgiving argument parsing + continued improvements to
-continuous mode and memory/prediction diagnostics.
+Geometry training epochs now scale dynamically with the amount of
+data collected. Much better for long continuous runs.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.25")
+    print("  MetaField Distributed v1.26 (Dynamic Geometry Training)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -87,7 +87,6 @@ def parse_args():
     p.add_argument("--master-port", type=int, default=29500)
     p.add_argument("--backend", default="gloo")
 
-    # More forgiving boolean argument
     def parse_bool(v):
         if isinstance(v, bool):
             return v
@@ -95,10 +94,10 @@ def parse_args():
             return True
         if v.lower() in ('false', '0', 'no', 'n'):
             return False
-        return True  # default to True if unclear
+        return True
 
     p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True,
-                   help="Include fermions (default: true). Accepts true/false, 1/0, yes/no")
+                   help="Include fermions (default: true)")
 
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
@@ -126,19 +125,8 @@ def init_distributed(args):
 
     if world_size > 1:
         if master_addr.startswith("127."):
-            print("\n[CRITICAL ERROR] Your system is resolving to localhost (127.0.0.1 or 127.0.1.1).")
-            print("This is almost always caused by a line in /etc/hosts like:")
-            print("    127.0.1.1   your-hostname")
-            print("")
-            print("Please run this on BOTH machines:")
-            print("    sudo nano /etc/hosts")
-            print("Then comment out (add # in front of) the 127.0.1.1 line and save.")
-            print("")
-            print("After that, reboot or run: sudo systemctl restart systemd-resolved")
-            print("")
-            print("Alternatively, force the correct IP with:")
-            print(f"    export MASTER_ADDR=YOUR_REAL_IP")
-            print(f"    python meta_field_distributed.py --role {role} --world-size {world_size} ...\n")
+            print("\n[CRITICAL ERROR] Your system is resolving to localhost.")
+            print("Please comment out 127.0.1.1 in /etc/hosts on both machines.")
             sys.exit(1)
 
         print(f"[Distributed] Initializing process group... (role={role}, rank={rank}, world_size={world_size}, master={master_addr})")
@@ -622,8 +610,12 @@ def main():
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
-            loss = geometry.train_on_batch(hmc.field_samples, epochs=30)
-            print(f"Final AE loss after 30 epochs: {loss:.4e}")
+            # Dynamic epoch count based on number of samples
+            num_samples = len(hmc.field_samples)
+            geom_epochs = max(30, min(200, num_samples // 5))
+
+            loss = geometry.train_on_batch(hmc.field_samples, epochs=geom_epochs)
+            print(f"Final AE loss after {geom_epochs} epochs: {loss:.4e}")
 
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
