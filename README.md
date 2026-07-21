@@ -1,87 +1,95 @@
 # MetaField
 
-**A lattice gauge theory simulator with a growing memory and prediction layer.**
+**A lattice gauge theory simulator with memory, prediction, and a growing path toward distributed swarm intelligence.**
 
-MetaField is a distributed Hybrid Monte Carlo (HMC) engine for SU(3) lattice gauge theory (quenched and dynamical fermions) combined with a learned geometric representation of field configurations. It is designed as a foundation for systems that accumulate experience and form expectations inside a mathematically consistent simulated universe.
+MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge theory (quenched and dynamical fermions) with a learned geometric representation and an episodic memory + prediction layer. It is designed as the foundation for an intelligence that grows inside a mathematically consistent simulated universe.
 
-## Current Capabilities (v1.19)
+---
 
-- Stable distributed HMC (single or multi-node) with high acceptance rates
+## Current State (v1.28)
+
+- Stable HMC (single or multi-node) with high acceptance
 - Wilson gauge action + Wilson-Dirac operator with pseudofermions
-- Learned Information Geometry: autoencoder on field configurations with Fisher metric and curvature estimation
-- Episodic memory system that stores contextual experiences (latent states + observables)
-- Latent predictor that begins forming expectations about future behavior
-- Prioritized replay based on reconstruction error, curvature, and prediction difficulty
-- Rich diagnostics and visualizations (latent space, reconstruction error, action history)
+- Learned Information Geometry with Fisher metric and curvature estimation
+- Episodic memory with prioritized replay
+- Latent predictor that forms expectations about future behavior
+- Dynamic geometry training (epochs now scale with the amount of data collected)
+- Clean continuous mode (`--continuous`) with efficient predictor updates
+- More forgiving argument parsing
 
-## Philosophy
+---
 
-Rather than treating this as a physics simulator with AI components attached, the project explores what it means to build an intelligence that *grows up inside* a simulated physical universe. The simulation is the environment. Memory, prediction, and eventual agency emerge from interacting with that world.
+## Long-term Vision: Aurora + MetaField Super Hybrid
+
+We are actively working toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc), turning Aurora’s distributed swarm infrastructure into the coordination layer for MetaField.
+
+**Goal**: A distributed swarm that runs physics simulations as its native environment, accumulates structured memory across machines, and gradually develops curiosity, goals, and reasoning.
+
+See:
+- `HYBRID_VISION.md` — High-level architecture and philosophy
+- `INTEGRATION_PLAN.md` — Concrete phased roadmap
+
+---
 
 ## Quick Start (Single Machine)
 
 ```bash
-# Clone
 git clone https://github.com/TheBabelDragon/metafield.git
 cd metafield
 
-# Create environment
 python -m venv ../.venv
 source ../.venv/bin/activate
 pip install torch matplotlib scikit-learn
 
-# Run with full diagnostics and memory/prediction layer
-python meta_field_distributed.py --world-size 1 --include-fermions true --diagnostic
+# Recommended: long-running continuous mode
+python meta_field_distributed.py --world-size 1 --include-fermions --diagnostic --continuous
 ```
 
-This will run HMC trajectories while training the geometry model and the latent predictor, and will save diagnostic plots (`latent_space.png`, `reconstruction_error.png`).
+**Note**: `--include-fermions` now accepts many formats (`true`, `false`, `1`, `0`, `yes`, `no`, or just the flag itself).
+
+---
+
+## Key Improvements in Recent Versions
+
+- **Dynamic geometry training** — Autoencoder epochs now scale with the number of samples collected (better for long runs).
+- **Optimized predictor training** — In continuous mode, the predictor is updated less frequently for better performance.
+- **More forgiving CLI** — `--include-fermions` is now much easier to use.
+- **Cleaner continuous mode logging** — Less noise, more useful periodic summaries.
+
+---
 
 ## Key Components
 
-| Component                    | Description                                                                 |
-|-----------------------------|-----------------------------------------------------------------------------|
-| `DistributedHMC`            | Core Hybrid Monte Carlo engine (gauge + fermions)                           |
-| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on field configurations                   |
-| `EpisodicMemory`            | Stores contextual experiences with prioritization                           |
-| `LatentPredictor`           | Learns to predict future observables from latent state                      |
-| `DistributedLattice`        | Domain-decomposed lattice with halo exchange (Gloo backend)                 |
+| Component                    | Description                                      |
+|-----------------------------|--------------------------------------------------|
+| `DistributedHMC`            | Core Hybrid Monte Carlo engine                   |
+| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on fields      |
+| `EpisodicMemory`            | Stores contextual experiences with prioritization|
+| `LatentPredictor`           | Learns expectations from latent state            |
 
-## Running on Multiple Machines
+---
 
-The code supports distributed execution via `torch.distributed` (Gloo over TCP). Example for a 2-node run:
+## Continuous Mode (Recommended)
 
 ```bash
-# On control node (rank 0)
-python meta_field_distributed.py --role control --world-size 2
-
-# On worker node
-python meta_field_distributed.py --role worker --master-addr <CONTROL-IP> --world-size 2
+python meta_field_distributed.py --world-size 1 --include-fermions --diagnostic --continuous
 ```
 
-## Output & Diagnostics
+Press `Ctrl+C` to stop cleanly. The system now handles long runs more efficiently.
 
-When running with `--diagnostic`, the system produces:
+---
 
-- `latent_space.png` — 2D projection of the learned latent manifold
-- `reconstruction_error.png` — Autoencoder reconstruction quality
-- Console output showing prediction loss and memory buffer statistics
+## Multi-Machine / Distributed
 
-## Long-term Direction
+Still experimental due to Gloo + system configuration issues on some machines (common `127.0.1.1` in `/etc/hosts` problem). See the error messages in the code for the recommended fix.
 
-The project is evolving from a world generator toward an agent that:
-
-- Accumulates episodic memory of interesting physical configurations
-- Develops expectations about its own dynamics
-- Prioritizes surprising or informative experiences
-- Eventually builds internal world models and active experimentation
-
-The simulation is not just data — it is the environment in which reasoning can emerge.
+---
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch 2.0+
-- (Optional) matplotlib + scikit-learn for visualizations
+- matplotlib + scikit-learn (for visualizations)
 
 ## License
 
@@ -89,4 +97,4 @@ MIT License
 
 ---
 
-*This is an active research project exploring the intersection of lattice gauge theory, geometric deep learning, and agentic systems in simulated physical environments.*
+*Active development toward a distributed physics-based intelligence swarm.*
