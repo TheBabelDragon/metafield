@@ -1,66 +1,92 @@
-# MetaField v2
+# MetaField
 
-**PyTorch backend for lattice field theory simulation** — built around algorithms genuinely used in lattice QCD research (not toy stand-ins).
+**A lattice gauge theory simulator with a growing memory and prediction layer.**
 
-## Highlights
+MetaField is a distributed Hybrid Monte Carlo (HMC) engine for SU(3) lattice gauge theory (quenched and dynamical fermions) combined with a learned geometric representation of field configurations. It is designed as a foundation for systems that accumulate experience and form expectations inside a mathematically consistent simulated universe.
 
-- **GaugeFieldV2**: SU(N) links, real Wilson plaquette action, **autograd-computed force** (dS/dU via `torch.autograd`, not hand-derived staples), exact group exponential update.
-- **WilsonDiracOperator**: The actual Wilson-Dirac operator with real 4×4 Euclidean gamma matrices and Wilson term to lift fermion doublers — the standard operator used in lattice QCD.
-- **cg_solve**: Complex-valued conjugate gradient for D x = b, solved via the normal equations using the γ5-Hermiticity identity.
-- **HMC**: Quenched (pure-gauge) *and* dynamical-fermion Hybrid Monte Carlo with Gaussian momentum refresh, leapfrog integration, and Metropolis accept/reject. Samples the correct equilibrium distribution.
-- **PseudofermionField**: Exact one-shot heatbath refresh + efficient force computation (stationary-point trick so CG is not inside autograd).
-- **LearnedInformationGeometry**: Autoencoder trained on real CG solutions from HMC trajectories → Fisher metric, Christoffel symbols, Riemann/Ricci tensor, and scalar curvature on the latent manifold of physical fields.
+## Current Capabilities (v1.19)
 
-## Important Caveat
+- Stable distributed HMC (single or multi-node) with high acceptance rates
+- Wilson gauge action + Wilson-Dirac operator with pseudofermions
+- Learned Information Geometry: autoencoder on field configurations with Fisher metric and curvature estimation
+- Episodic memory system that stores contextual experiences (latent states + observables)
+- Latent predictor that begins forming expectations about future behavior
+- Prioritized replay based on reconstruction error, curvature, and prediction difficulty
+- Rich diagnostics and visualizations (latent space, reconstruction error, action history)
 
-> This file was written in a sandbox with no PyTorch installed and no network access, so it could not be executed or debugged against a real interpreter before being handed over. The physics and the algorithms are standard and were transcribed carefully, but **treat first execution as a debugging pass**, not a guaranteed clean run.
+## Philosophy
 
-Shape mismatches, dtype issues, or numerical problems are the most likely failure modes. Please report anything that breaks.
+Rather than treating this as a physics simulator with AI components attached, the project explores what it means to build an intelligence that *grows up inside* a simulated physical universe. The simulation is the environment. Memory, prediction, and eventual agency emerge from interacting with that world.
 
-## Installation
-
-```bash
-pip install torch
-# GPU: https://pytorch.org/get-started/locally/
-```
-
-## Run
+## Quick Start (Single Machine)
 
 ```bash
-python meta_field_sim_torch.py
+# Clone
+git clone https://github.com/TheBabelDragon/metafield.git
+cd metafield
+
+# Create environment
+python -m venv ../.venv
+source ../.venv/bin/activate
+pip install torch matplotlib scikit-learn
+
+# Run with full diagnostics and memory/prediction layer
+python meta_field_distributed.py --world-size 1 --include-fermions true --diagnostic
 ```
 
-The `__main__` block runs a small dynamical HMC example on a 4⁴ lattice with learned geometry enabled. It will be noticeably slower with `include_fermions=True` because of the CG solves inside the leapfrog integrator.
+This will run HMC trajectories while training the geometry model and the latent predictor, and will save diagnostic plots (`latent_space.png`, `reconstruction_error.png`).
 
-Tweak `ConfigV2` at the bottom of the script for different lattice sizes, β, trajectory counts, or to run quenched (faster) mode.
+## Key Components
 
-## Physics & Design Choices
+| Component                    | Description                                                                 |
+|-----------------------------|-----------------------------------------------------------------------------|
+| `DistributedHMC`            | Core Hybrid Monte Carlo engine (gauge + fermions)                           |
+| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on field configurations                   |
+| `EpisodicMemory`            | Stores contextual experiences with prioritization                           |
+| `LatentPredictor`           | Learns to predict future observables from latent state                      |
+| `DistributedLattice`        | Domain-decomposed lattice with halo exchange (Gloo backend)                 |
 
-- Uses **automatic differentiation** for the gauge force — a deliberate "differentiable physics" design choice instead of the traditional analytic staple force.
-- Wilson-Dirac operator follows the standard Euclidean formulation (Degrand & DeTar convention).
-- Dynamical fermions use the textbook pseudofermion heatbath (exact, no inner MCMC loop).
-- The learned geometry component is trained for free on the CG solutions that the simulation already computes.
+## Running on Multiple Machines
 
-## Future Work (Documented Stubs)
+The code supports distributed execution via `torch.distributed` (Gloo over TCP). Example for a 2-node run:
 
-The following are intentionally left as documented roadmap items rather than fake implementations:
+```bash
+# On control node (rank 0)
+python meta_field_distributed.py --role control --world-size 2
 
-- `NeuralEffectiveAction` (GNN effective action)
-- `FourierNeuralOperator`
-- `DistributedLattice` (see companion script `meta_field_distributed.py` for torch.distributed + Gloo domain decomposition)
-- Multigrid solvers, RHMC, etc.
+# On worker node
+python meta_field_distributed.py --role worker --master-addr <CONTROL-IP> --world-size 2
+```
 
-Each is its own substantial research project.
+## Output & Diagnostics
 
-## References
+When running with `--diagnostic`, the system produces:
 
-- T. DeGrand & C. DeTar, *Lattice Methods for Quantum Chromodynamics* (World Scientific, 2006)
-- Standard lattice QCD literature on HMC, Wilson fermions, and pseudofermions.
+- `latent_space.png` — 2D projection of the learned latent manifold
+- `reconstruction_error.png` — Autoencoder reconstruction quality
+- Console output showing prediction loss and memory buffer statistics
+
+## Long-term Direction
+
+The project is evolving from a world generator toward an agent that:
+
+- Accumulates episodic memory of interesting physical configurations
+- Develops expectations about its own dynamics
+- Prioritizes surprising or informative experiences
+- Eventually builds internal world models and active experimentation
+
+The simulation is not just data — it is the environment in which reasoning can emerge.
+
+## Requirements
+
+- Python 3.10+
+- PyTorch 2.0+
+- (Optional) matplotlib + scikit-learn for visualizations
 
 ## License
 
-MIT — see the [LICENSE](LICENSE) file for details.
+MIT License
 
 ---
 
-*Built as part of the MetaField project exploring lattice field theory, geometry, and machine learning.*
+*This is an active research project exploring the intersection of lattice gauge theory, geometric deep learning, and agentic systems in simulated physical environments.*
