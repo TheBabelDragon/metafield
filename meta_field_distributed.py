@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.19 (Final Improvements)
+meta_field_distributed.py v1.20
 
-Polished and stabilized version of the memory + prediction layer.
-This represents the strongest single-machine state of the system.
+- --save-plots flag (PNGs now opt-in)
+- --continuous mode (run until Ctrl+C)
+- Cleaner interrupt handling
 
-Direction: Moving from "world generator" toward an agent that
-accumulates experience and forms expectations inside its own
-simulated universe.
+Workflow improvement for long-running learning sessions.
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ def get_local_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.19 (Final Improvements)")
+    print("  MetaField Distributed v1.20")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -80,6 +79,10 @@ def parse_args():
     p.add_argument("--backend", default="gloo")
     p.add_argument("--include-fermions", type=lambda x: str(x).lower() in ['true', '1', 'yes'], default=True)
     p.add_argument("--diagnostic", action="store_true", default=False)
+    p.add_argument("--save-plots", action="store_true", default=False,
+                   help="Generate and save PNG plots (latent_space.png, reconstruction_error.png)")
+    p.add_argument("--continuous", action="store_true", default=False,
+                   help="Run continuously until KeyboardInterrupt (Ctrl+C) instead of fixed trajectories")
     return p.parse_args()
 
 
@@ -126,7 +129,6 @@ class EpisodicExperience:
         self.priority = 1.0
 
     def update_priority(self, prediction_error: float = 0.0):
-        # Prioritize experiences that are surprising or hard to predict
         self.priority = max(0.5,
                             1.0 +
                             2.0 * abs(self.curvature) +
@@ -465,12 +467,18 @@ def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
 
+    # If continuous mode, we ignore hmc_trajectories and run until interrupted
+    if args.continuous:
+        hmc_trajectories = 10**9  # effectively infinite
+    else:
+        hmc_trajectories = 25
+
     config = ConfigV2(
         L=4,
         beta=5.5,
         hmc_n_leapfrog=20,
         hmc_step_size=0.012,
-        hmc_trajectories=25,
+        hmc_trajectories=hmc_trajectories,
         include_fermions=args.include_fermions,
         seed=42 + rank,
         device="cpu",
@@ -494,62 +502,68 @@ def main():
 
     if rank == 0:
         mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED (gauge only)"
-        print(f"Starting {mode} HMC on {world_size} rank(s)...\n")
+        run_mode = "CONTINUOUS (Ctrl+C to stop)" if args.continuous else f"{hmc_trajectories} trajectories"
+        print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
-    for t in range(config.hmc_trajectories):
-        res = hmc.trajectory()
+    interrupted = False
 
-        if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
-            if geometry is None:
-                input_dim = hmc.field_samples[0].shape[0]
-                geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
+    try:
+        for t in range(config.hmc_trajectories):
+            res = hmc.trajectory()
 
-            with torch.no_grad():
-                z = geometry.encode(hmc.field_samples[-1])
+            if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
+                if geometry is None:
+                    input_dim = hmc.field_samples[0].shape[0]
+                    geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
-            exp = EpisodicExperience(
-                latent=z,
-                action=hmc.action_history[-1] if hmc.action_history else 0.0,
-                delta_h=res["delta_h"],
-                accepted=res["accepted"],
-            )
-            memory.add(exp)
+                with torch.no_grad():
+                    z = geometry.encode(hmc.field_samples[-1])
 
-            # Train predictor with normalized targets for stability
-            if predictor is not None and len(memory.buffer) > 8:
-                batch = memory.sample(16)
-                recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
-                x_batch = torch.stack(recent).to(torch.float64)
-                z_batch = geometry.encode(x_batch)
+                exp = EpisodicExperience(
+                    latent=z,
+                    action=hmc.action_history[-1] if hmc.action_history else 0.0,
+                    delta_h=res["delta_h"],
+                    accepted=res["accepted"],
+                )
+                memory.add(exp)
 
-                # Normalize targets
-                actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
-                target_mean = actions.mean()
-                target_std = actions.std() + 1e-6
-                target = ((actions - target_mean) / target_std).unsqueeze(1)
+                if predictor is not None and len(memory.buffer) > 8:
+                    batch = memory.sample(16)
+                    recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
+                    x_batch = torch.stack(recent).to(torch.float64)
+                    z_batch = geometry.encode(x_batch)
 
-                pred = predictor(z_batch)
-                pred_loss = torch.mean((pred - target) ** 2)
+                    actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
+                    target_mean = actions.mean()
+                    target_std = actions.std() + 1e-6
+                    target = ((actions - target_mean) / target_std).unsqueeze(1)
 
-                predictor_optimizer.zero_grad()
-                pred_loss.backward()
-                torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-                predictor_optimizer.step()
+                    pred = predictor(z_batch)
+                    pred_loss = torch.mean((pred - target) ** 2)
 
-                # Update priorities
-                for e in batch:
-                    e.update_priority(float(pred_loss.item()))
+                    predictor_optimizer.zero_grad()
+                    pred_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+                    predictor_optimizer.step()
 
-                if t % 5 == 0:
-                    avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
-                    print(f"  [Memory] size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
+                    for e in batch:
+                        e.update_priority(float(pred_loss.item()))
 
+                    if t % 5 == 0:
+                        avg_priority = sum(e.priority for e in memory.buffer) / len(memory.buffer)
+                        print(f"  [Memory] size={len(memory)} | PredLoss={pred_loss.item():.2e} | AvgPriority={avg_priority:.2f}")
+
+            if rank == 0:
+                status = "ACCEPTED" if res["accepted"] else "REJECTED"
+                print(f"traj {t:02d} | dH={res['delta_h']:+.4f} | {status} (rate={res['acceptance_rate']:.2f})")
+
+    except KeyboardInterrupt:
+        interrupted = True
         if rank == 0:
-            status = "ACCEPTED" if res["accepted"] else "REJECTED"
-            print(f"traj {t:02d} | dH={res['delta_h']:+.4f} | {status} (rate={res['acceptance_rate']:.2f})")
+            print("\nInterrupted by user (Ctrl+C). Shutting down cleanly...")
 
     if rank == 0:
-        print("\nRun finished.")
+        print("\nRun finished." + (" (interrupted)" if interrupted else ""))
 
         if args.diagnostic and len(hmc.field_samples) > 10:
             print("\n=== Learned Information Geometry ===")
@@ -565,7 +579,8 @@ def main():
 
             print(f"\nLatent scalar curvature (improved): {R:.4f}")
 
-            if HAS_MATPLOTLIB:
+            # Only generate plots if explicitly requested
+            if args.save_plots and HAS_MATPLOTLIB:
                 try:
                     z2d, colors = geometry.get_latent_2d(hmc.field_samples)
                     if z2d is not None:
