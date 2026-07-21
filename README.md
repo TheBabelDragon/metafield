@@ -2,32 +2,38 @@
 
 **A lattice gauge theory simulator with memory, prediction, and a growing path toward distributed swarm intelligence.**
 
-MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge theory (quenched and dynamical fermions) with a learned geometric representation and an episodic memory + prediction layer. It is designed as the foundation for an intelligence that grows inside a mathematically consistent simulated universe.
+MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge theory with a learned geometric representation of field configurations and an episodic memory + prediction layer. It is designed as the foundation for an intelligence that grows inside a mathematically consistent simulated universe.
 
 ---
 
-## Current State (v1.28)
+## Current Capabilities
 
-- Stable HMC (single or multi-node) with high acceptance
-- Wilson gauge action + Wilson-Dirac operator with pseudofermions
-- Learned Information Geometry with Fisher metric and curvature estimation
+- Stable Hybrid Monte Carlo (HMC) with high acceptance rates
+- Wilson gauge action + Wilson-Dirac operator
+- Learned Information Geometry (autoencoder + Fisher metric + curvature estimation)
 - Episodic memory with prioritized replay
 - Latent predictor that forms expectations about future behavior
-- Dynamic geometry training (epochs now scale with the amount of data collected)
-- Clean continuous mode (`--continuous`) with efficient predictor updates
-- More forgiving argument parsing
+- Dynamic geometry training (number of epochs scales with the amount of data collected)
+- Efficient continuous mode (`--continuous`) with reduced predictor update frequency
 
 ---
 
-## Long-term Vision: Aurora + MetaField Super Hybrid
+## Long-term Vision: The Aurora + MetaField Super Hybrid
 
-We are actively working toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc), turning Aurora’s distributed swarm infrastructure into the coordination layer for MetaField.
+We are building toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc) — turning Aurora’s distributed swarm infrastructure into the coordination and community compute layer for MetaField.
 
-**Goal**: A distributed swarm that runs physics simulations as its native environment, accumulates structured memory across machines, and gradually develops curiosity, goals, and reasoning.
+### What the Hybrid Enables
 
-See:
-- `HYBRID_VISION.md` — High-level architecture and philosophy
-- `INTEGRATION_PLAN.md` — Concrete phased roadmap
+Instead of treating distributed compute as a dumb resource pool, the hybrid treats the **swarm itself as an environment** in which intelligence can grow:
+
+- Aurora handles node discovery, scheduling, communication, resilience, and community compute across many machines.
+- MetaField provides the physics simulation (lattice QCD), learned geometry, episodic memory, and prediction systems.
+- Over time, MetaField’s internal signals (curvature, prediction difficulty, interesting configurations) can influence how Aurora allocates compute.
+- The result is a distributed system that runs physics as its native substrate and gradually develops memory, expectations, curiosity, and eventually agency.
+
+This is not "MetaField running on Aurora" or "Aurora with some physics mods." It is a true co-evolution where the swarm infrastructure and the physics-based intelligence layer strengthen each other.
+
+See `HYBRID_VISION.md` and `INTEGRATION_PLAN.md` for the detailed architecture and phased roadmap.
 
 ---
 
@@ -41,47 +47,46 @@ python -m venv ../.venv
 source ../.venv/bin/activate
 pip install torch matplotlib scikit-learn
 
-# Recommended: long-running continuous mode
-python meta_field_distributed.py --world-size 1 --include-fermions --diagnostic --continuous
+# Recommended for development
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous
 ```
 
-**Note**: `--include-fermions` now accepts many formats (`true`, `false`, `1`, `0`, `yes`, `no`, or just the flag itself).
+Press `Ctrl+C` to stop cleanly. Long-running sessions are well supported.
 
 ---
 
-## Key Improvements in Recent Versions
+## Key Improvements (Recent)
 
-- **Dynamic geometry training** — Autoencoder epochs now scale with the number of samples collected (better for long runs).
-- **Optimized predictor training** — In continuous mode, the predictor is updated less frequently for better performance.
-- **More forgiving CLI** — `--include-fermions` is now much easier to use.
-- **Cleaner continuous mode logging** — Less noise, more useful periodic summaries.
+- Geometry training epochs now scale dynamically with the number of samples collected
+- Predictor training frequency reduced in continuous mode for better performance during long runs
+- Cleaner, less noisy logging in continuous mode
 
 ---
 
 ## Key Components
 
-| Component                    | Description                                      |
-|-----------------------------|--------------------------------------------------|
-| `DistributedHMC`            | Core Hybrid Monte Carlo engine                   |
-| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on fields      |
-| `EpisodicMemory`            | Stores contextual experiences with prioritization|
-| `LatentPredictor`           | Learns expectations from latent state            |
+| Component                    | Description                                           |
+|-----------------------------|-------------------------------------------------------|
+| `DistributedHMC`            | Core Hybrid Monte Carlo engine                        |
+| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on field configurations |
+| `EpisodicMemory`            | Stores contextual experiences with prioritization     |
+| `LatentPredictor`           | Learns to predict future observables from latent state|
 
 ---
 
-## Continuous Mode (Recommended)
+## Continuous Mode
 
 ```bash
-python meta_field_distributed.py --world-size 1 --include-fermions --diagnostic --continuous
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous
 ```
 
-Press `Ctrl+C` to stop cleanly. The system now handles long runs more efficiently.
+This is currently the recommended way to run MetaField. The system is designed for extended sessions where memory and prediction can meaningfully develop.
 
 ---
 
-## Multi-Machine / Distributed
+## Multi-Machine
 
-Still experimental due to Gloo + system configuration issues on some machines (common `127.0.1.1` in `/etc/hosts` problem). See the error messages in the code for the recommended fix.
+Multi-machine support exists but remains fragile due to Gloo + common Linux hostname resolution issues (`127.0.1.1` in `/etc/hosts`). The code prints clear guidance when this problem is detected.
 
 ---
 
@@ -89,7 +94,7 @@ Still experimental due to Gloo + system configuration issues on some machines (c
 
 - Python 3.10+
 - PyTorch 2.0+
-- matplotlib + scikit-learn (for visualizations)
+- matplotlib + scikit-learn (for visualizations and geometry)
 
 ## License
 
@@ -97,4 +102,4 @@ MIT License
 
 ---
 
-*Active development toward a distributed physics-based intelligence swarm.*
+*Actively evolving toward a distributed physics-based intelligence swarm.*
