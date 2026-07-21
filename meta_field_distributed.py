@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.22
+meta_field_distributed.py v1.23
 
-Fixed localhost IP resolution bug that was breaking multi-machine runs.
-Now properly detects real LAN IP and gives clear errors/instructions.
+Much stronger error handling and diagnostics for the common
+127.0.1.1 hostname issue that breaks Gloo on many Linux machines.
 """
 
 from __future__ import annotations
@@ -46,19 +46,15 @@ from meta_field_sim_torch import (
 
 
 def get_real_lan_ip() -> str:
-    """Try hard to get a real non-loopback LAN IP."""
     try:
-        # Try hostname first
         hostname = socket.gethostname()
-        addrinfo = socket.getaddrinfo(hostname, None)
-        for info in addrinfo:
+        for info in socket.getaddrinfo(hostname, None):
             ip = info[4][0]
             if not ip.startswith("127."):
                 return ip
     except:
         pass
 
-    # Fallback: connect to external and see what interface we use
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -74,7 +70,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.22")
+    print("  MetaField Distributed v1.23")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -108,7 +104,6 @@ def init_distributed(args):
     else:
         rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
 
-    # Get master address
     if args.master_addr != "auto":
         master_addr = args.master_addr
     else:
@@ -116,21 +111,26 @@ def init_distributed(args):
 
     master_port = args.master_port
 
-    # Safety check for multi-machine
-    if world_size > 1 and master_addr.startswith("127."):
-        print("\n[ERROR] Could not determine your real LAN IP address.")
-        print("Please run with --master-addr set to this machine's actual IP.")
-        print("Example on control node:")
-        print("  python meta_field_distributed.py --role control --world-size 2 --master-addr 192.168.1.105 --continuous --diagnostic\n")
-        sys.exit(1)
-
-    os.environ.setdefault("MASTER_ADDR", master_addr)
-    os.environ.setdefault("MASTER_PORT", str(master_port))
-    os.environ.setdefault("WORLD_SIZE", str(world_size))
-    os.environ["RANK"] = str(rank)
-
+    # Strong guard for multi-machine
     if world_size > 1:
+        if master_addr.startswith("127."):
+            print("\n[CRITICAL ERROR] Your system is resolving to localhost (127.0.0.1 or 127.0.1.1).")
+            print("This is almost always caused by a line in /etc/hosts like:")
+            print("    127.0.1.1   your-hostname")
+            print("")
+            print("Please run this on BOTH machines:")
+            print("    sudo nano /etc/hosts")
+            print("Then comment out (add # in front of) the 127.0.1.1 line and save.")
+            print("")
+            print("After that, reboot or run: sudo systemctl restart systemd-resolved")
+            print("")
+            print("Alternatively, force the correct IP with:")
+            print(f"    export MASTER_ADDR=YOUR_REAL_IP")
+            print(f"    python meta_field_distributed.py --role {role} --world-size {world_size} ...\n")
+            sys.exit(1)
+
         print(f"[Distributed] Initializing process group... (role={role}, rank={rank}, world_size={world_size}, master={master_addr})")
+
         try:
             dist.init_process_group(
                 backend=args.backend,
