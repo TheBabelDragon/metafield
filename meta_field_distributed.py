@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.27
+meta_field_distributed.py v1.28
 
-Optimized predictor training frequency in continuous mode.
-Dynamic geometry training epochs now correctly scale with data.
+Quick syntax fix.
 """
 
 from __future__ import annotations
@@ -70,7 +69,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.27")
+    print("  MetaField Distributed v1.28")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -478,7 +477,7 @@ class DistributedHMC:
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P += coeff * (1j * F)
 
-        action1 = float(self.gauge.wilson_action(U).real()
+        action1 = float(self.gauge.wilson_action(U).real)
         kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
         H1 = lat.global_sum(kinetic1) + action1
         delta_h = float((H1 - H0).real)
@@ -569,7 +568,6 @@ def main():
                 )
                 memory.add(exp)
 
-                # Optimized: Train predictor less frequently in continuous mode
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(16)
                     recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
@@ -610,7 +608,6 @@ def main():
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
-            # Dynamic epoch count based on number of samples
             num_samples = len(hmc.field_samples)
             geom_epochs = max(30, min(200, num_samples // 5))
 
