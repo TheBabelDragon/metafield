@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.39
+meta_field_distributed.py v1.40
 
-Persistent Attractor Memory (first version).
-High-interestingness replay begins deforming the latent geometry.
+Force-based Attractor Dynamics.
+Attractors interact continuously; merge is emergent.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ except ImportError:
 from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
 from geometry import LearnedInformationGeometry
+from attractors import AttractorDynamics
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -65,11 +66,11 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.39 (Persistent Attractor Memory)")
+    print("  MetaField Distributed v1.40 (Force-based Attractor Dynamics)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + INTERESTINGNESS]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTOR LANDSCAPE]")
     print()
 
 
@@ -372,6 +373,7 @@ def main():
     hmc = DistributedHMC(gauge, dirac, config, gen, pseudo, diagnostic=args.diagnostic)
 
     memory = EpisodicMemory() if (args.diagnostic and rank == 0) else None
+    attractor_dyn = AttractorDynamics() if (args.diagnostic and rank == 0) else None
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
 
@@ -416,7 +418,16 @@ def main():
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
-                    batch = memory.sample(16)  # this also reinforces attractors
+                    batch = memory.sample(16)
+
+                    # Feed high-interest experiences into attractor dynamics
+                    for e in batch:
+                        if e.interestingness > 0.8:
+                            attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
+
+                    # Evolve the attractor landscape
+                    attractor_dyn.step()
+
                     recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
@@ -438,12 +449,9 @@ def main():
                     for e in batch:
                         e.update_priority(prediction_error=pred_err, reconstruction_error=recon_error)
 
-                    # Periodically decay unused attractors
-                    if t % 100 == 0:
-                        memory.decay_attractors()
-
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
+                    att_stats = attractor_dyn.get_stats()
                     recent_pred_loss = None
 
                     if predictor is not None and len(memory.buffer) > 8:
@@ -468,8 +476,9 @@ def main():
                         f"[Summary @ {t}] Health: {health} | "
                         f"Mem: {mem_stats.get('size', 0)} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
-                        f"Attractors: {mem_stats.get('num_attractors', 0)} "
-                        f"(str={mem_stats.get('avg_attractor_strength', 0):.2f}) | "
+                        f"Attractors: {att_stats.get('num_attractors', 0)} "
+                        f"(str={att_stats.get('avg_strength', 0):.2f}, "
+                        f"r={att_stats.get('avg_radius', 0):.2f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f}",
                         end=""
                     )
@@ -491,27 +500,26 @@ def main():
         print("\nRun finished." + (" (interrupted)" if interrupted else ""))
 
         if args.diagnostic and len(hmc.field_samples) > 10:
-            print("\n=== Learned Information Geometry (with Attractors) ===")
+            print("\n=== Learned Information Geometry (shaped by Attractor Landscape) ===")
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
             num_samples = len(hmc.field_samples)
             geom_epochs = max(30, min(200, num_samples // 5))
 
-            attractors = memory.get_attractor_latents() if memory else None
+            landscape = attractor_dyn.get_landscape() if attractor_dyn else None
             loss = geometry.train_on_batch(
                 hmc.field_samples,
                 epochs=geom_epochs,
-                attractors=attractors
+                attractors=landscape
             )
             print(f"Final AE loss after {geom_epochs} epochs: {loss:.4e}")
-            if attractors:
-                print(f"Trained with {len(attractors)} persistent attractors")
+            if landscape:
+                print(f"Geometry shaped by {len(landscape)} attractors")
 
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
-
             print(f"\nLatent scalar curvature: {R:.4f}")
 
             if args.save_plots and HAS_MATPLOTLIB:
@@ -521,7 +529,7 @@ def main():
                         plt.figure(figsize=(7, 5))
                         scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=50, alpha=0.85)
                         plt.colorbar(scatter, label='Mean |field|')
-                        plt.title('2D Latent Space of Field Configurations')
+                        plt.title('2D Latent Space')
                         plt.tight_layout()
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
