@@ -4,9 +4,8 @@ memory.py
 
 Episodic memory system with prioritization and interestingness.
 
-Designed for modularity and future Aurora integration.
-Supports adaptive exploration driven by average interestingness
-(self-regulating curiosity loop).
+Supports adaptive exploration and multi-signal interestingness
+(curvature + ΔH + prediction error + reconstruction error).
 """
 
 from typing import List, Dict, Any, Optional
@@ -33,29 +32,34 @@ class EpisodicExperience:
         self.priority = 1.0
         self.interestingness = 0.0
 
-    def compute_interestingness(self, prediction_error: float = 0.0) -> float:
+    def compute_interestingness(self, prediction_error: float = 0.0,
+                                reconstruction_error: float = 0.0) -> float:
         """
-        Compute a simple interestingness / curiosity signal.
+        Compute a multi-signal interestingness / curiosity score.
 
         Combines:
         - Absolute curvature (geometric novelty)
         - Absolute ΔH (energetic surprise)
         - Prediction error (model surprise)
+        - Reconstruction error (how hard the configuration is for the autoencoder)
         """
         curv_term = abs(self.curvature)
         delta_term = abs(self.delta_h)
         pred_term = max(0.0, prediction_error)
+        recon_term = max(0.0, reconstruction_error)
 
         self.interestingness = (
             1.5 * curv_term +
             1.0 * delta_term +
-            2.0 * pred_term
+            2.0 * pred_term +
+            1.5 * recon_term
         )
         return self.interestingness
 
-    def update_priority(self, prediction_error: float = 0.0):
-        """Update priority using interestingness and other signals."""
-        self.compute_interestingness(prediction_error)
+    def update_priority(self, prediction_error: float = 0.0,
+                        reconstruction_error: float = 0.0):
+        """Update priority using the full interestingness signal."""
+        self.compute_interestingness(prediction_error, reconstruction_error)
 
         self.priority = max(
             0.5,
@@ -71,9 +75,8 @@ class EpisodicMemory:
     Prioritized episodic memory buffer with interestingness support.
 
     Features:
-    - Strong interestingness-biased sampling
+    - Multi-signal interestingness
     - Adaptive exploration rate driven by average interestingness
-      (self-regulating curiosity)
     - Basic associative retrieval
     - Rich stats for observability / Aurora sensing
     """
@@ -99,53 +102,39 @@ class EpisodicMemory:
         """
         Adaptive exploration rate based on average interestingness.
 
-        - Low average interestingness → higher exploration (seek novelty)
-        - High average interestingness → lower exploration (exploit interesting regions)
+        Low average interestingness → higher exploration (seek novelty)
+        High average interestingness → lower exploration (exploit interesting regions)
         """
         if not self.buffer:
             return self.base_exploration_rate
 
         avg_interest = sum(e.interestingness for e in self.buffer) / len(self.buffer)
-
-        # Simple inverse mapping: higher interest → lower exploration
-        # Tunable constants — keep within [min_exploration, max_exploration]
         rate = self.base_exploration_rate * (1.5 / (1.0 + avg_interest))
         return max(self.min_exploration, min(self.max_exploration, rate))
 
     def sample(self, n: int = 16) -> List[EpisodicExperience]:
-        """
-        Sample n experiences with adaptive interestingness bias + exploration.
-
-        Exploration rate is adjusted dynamically based on the current
-        average interestingness of the memory buffer.
-        """
+        """Sample n experiences with adaptive interestingness bias + exploration."""
         if len(self.buffer) == 0:
             return []
         if len(self.buffer) <= n:
             return list(self.buffer)
 
         exploration_rate = self._current_exploration_rate()
-
         n_explore = max(1, int(n * exploration_rate))
         n_biased = n - n_explore
 
-        # Biased sampling (sharpened priority distribution)
         priorities = torch.tensor([e.priority for e in self.buffer], dtype=torch.float32)
         sharpened = priorities ** 1.5
         probs = sharpened / sharpened.sum()
         biased_indices = torch.multinomial(probs, n_biased, replacement=True)
 
-        # Pure exploration
         explore_indices = torch.randint(0, len(self.buffer), (n_explore,))
 
         all_indices = torch.cat([biased_indices, explore_indices])
         return [self.buffer[i] for i in all_indices]
 
     def find_similar(self, query_latent: torch.Tensor, k: int = 5) -> List[EpisodicExperience]:
-        """
-        Simple associative retrieval: return the k experiences whose
-        latents are closest (by L2 distance) to the query.
-        """
+        """Return the k experiences closest in latent space to the query."""
         if not self.buffer:
             return []
 
@@ -159,9 +148,7 @@ class EpisodicMemory:
         return [self.buffer[i] for _, i in distances[:k]]
 
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Return rich statistics for monitoring / sensing / emergence tracking.
-        """
+        """Return rich statistics for monitoring / sensing / emergence tracking."""
         if not self.buffer:
             return {
                 "size": 0,
