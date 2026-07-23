@@ -5,7 +5,7 @@ memory.py
 Episodic memory system with prioritization and interestingness.
 
 Designed for modularity and future Aurora integration.
-This version begins supporting emergence signals (curiosity / interestingness).
+This version supports stronger emergence signals via interestingness-biased sampling.
 """
 
 from typing import List, Dict, Any, Optional
@@ -70,13 +70,16 @@ class EpisodicMemory:
     """
     Prioritized episodic memory buffer with interestingness support.
 
-    Supports prioritized sampling and basic associative retrieval.
+    Supports strongly interestingness-biased sampling (with a small amount of
+    pure random exploration) and basic associative retrieval.
     Includes rich `get_stats()` for observability and Aurora sensing.
     """
 
-    def __init__(self, max_size: int = 256):
+    def __init__(self, max_size: int = 256, exploration_rate: float = 0.15):
         self.buffer: List[EpisodicExperience] = []
         self.max_size = max_size
+        # Fraction of samples drawn uniformly at random (encourages exploration)
+        self.exploration_rate = exploration_rate
 
     def add(self, exp: EpisodicExperience) -> None:
         """Add a new experience to memory."""
@@ -87,13 +90,34 @@ class EpisodicMemory:
             self.buffer.pop(0)
 
     def sample(self, n: int = 16) -> List[EpisodicExperience]:
-        """Sample n experiences using priority-based sampling."""
-        if len(self.buffer) < n:
+        """
+        Sample n experiences with strong interestingness bias + exploration.
+
+        - Most samples are drawn according to priority (which is driven by interestingness)
+        - A small fraction (`exploration_rate`) are drawn uniformly at random
+          so the system does not get stuck only replaying the same high-interest items.
+        """
+        if len(self.buffer) == 0:
+            return []
+        if len(self.buffer) <= n:
             return list(self.buffer)
+
+        # Decide how many samples come from pure exploration
+        n_explore = max(1, int(n * self.exploration_rate))
+        n_biased = n - n_explore
+
+        # --- Biased sampling (interestingness / priority driven) ---
         priorities = torch.tensor([e.priority for e in self.buffer], dtype=torch.float32)
-        probs = priorities / priorities.sum()
-        indices = torch.multinomial(probs, n, replacement=True)
-        return [self.buffer[i] for i in indices]
+        # Sharpen the distribution a bit so high-interest items dominate more
+        sharpened = priorities ** 1.5
+        probs = sharpened / sharpened.sum()
+        biased_indices = torch.multinomial(probs, n_biased, replacement=True)
+
+        # --- Pure exploration (uniform random) ---
+        explore_indices = torch.randint(0, len(self.buffer), (n_explore,))
+
+        all_indices = torch.cat([biased_indices, explore_indices])
+        return [self.buffer[i] for i in all_indices]
 
     def find_similar(self, query_latent: torch.Tensor, k: int = 5) -> List[EpisodicExperience]:
         """
