@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.38
+meta_field_distributed.py v1.39
 
-Enriched interestingness signal (now includes geometry reconstruction error).
+Persistent Attractor Memory (first version).
+High-interestingness replay begins deforming the latent geometry.
 """
 
 from __future__ import annotations
@@ -24,11 +25,9 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-# === Hybrid modular imports ===
 from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
 from geometry import LearnedInformationGeometry
-
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -52,7 +51,6 @@ def get_real_lan_ip() -> str:
                 return ip
     except:
         pass
-
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -62,17 +60,16 @@ def get_real_lan_ip() -> str:
             return ip
     except:
         pass
-
     return "127.0.0.1"
 
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.38 (Enriched Curiosity)")
+    print("  MetaField Distributed v1.39 (Persistent Attractor Memory)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + PREDICTION + INTERESTINGNESS]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + INTERESTINGNESS]")
     print()
 
 
@@ -148,14 +145,6 @@ def init_distributed(args):
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-def simple_sparkline(data: List[float], width: int = 50) -> str:
-    if not data: return ""
-    min_v, max_v = min(data), max(data)
-    if max_v == min_v: return "=" * width
-    scale = (max_v - min_v) or 1.0
-    return ''.join(chr(0x2581 + min(7, int((v - min_v) / scale * 7))) for v in data[:width])
 
 
 class DistributedLattice:
@@ -408,7 +397,6 @@ def main():
                 with torch.no_grad():
                     z = geometry.encode(hmc.field_samples[-1])
 
-                # Compute reconstruction error for the latest sample
                 recon_error = 0.0
                 try:
                     with torch.no_grad():
@@ -428,7 +416,7 @@ def main():
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
-                    batch = memory.sample(16)
+                    batch = memory.sample(16)  # this also reinforces attractors
                     recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
@@ -449,6 +437,10 @@ def main():
                     pred_err = float(pred_loss.item())
                     for e in batch:
                         e.update_priority(prediction_error=pred_err, reconstruction_error=recon_error)
+
+                    # Periodically decay unused attractors
+                    if t % 100 == 0:
+                        memory.decay_attractors()
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
@@ -475,8 +467,9 @@ def main():
                     print(
                         f"[Summary @ {t}] Health: {health} | "
                         f"Mem: {mem_stats.get('size', 0)} | "
-                        f"AvgPrio: {mem_stats.get('avg_priority', 0):.2f} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
+                        f"Attractors: {mem_stats.get('num_attractors', 0)} "
+                        f"(str={mem_stats.get('avg_attractor_strength', 0):.2f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f}",
                         end=""
                     )
@@ -498,21 +491,28 @@ def main():
         print("\nRun finished." + (" (interrupted)" if interrupted else ""))
 
         if args.diagnostic and len(hmc.field_samples) > 10:
-            print("\n=== Learned Information Geometry ===")
+            print("\n=== Learned Information Geometry (with Attractors) ===")
             input_dim = hmc.field_samples[0].shape[0]
             geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
 
             num_samples = len(hmc.field_samples)
             geom_epochs = max(30, min(200, num_samples // 5))
 
-            loss = geometry.train_on_batch(hmc.field_samples, epochs=geom_epochs)
+            attractors = memory.get_attractor_latents() if memory else None
+            loss = geometry.train_on_batch(
+                hmc.field_samples,
+                epochs=geom_epochs,
+                attractors=attractors
+            )
             print(f"Final AE loss after {geom_epochs} epochs: {loss:.4e}")
+            if attractors:
+                print(f"Trained with {len(attractors)} persistent attractors")
 
             with torch.no_grad():
                 z = geometry.encode(hmc.field_samples[-1])
                 R = geometry.scalar_curvature(z)
 
-            print(f"\nLatent scalar curvature (improved): {R:.4f}")
+            print(f"\nLatent scalar curvature: {R:.4f}")
 
             if args.save_plots and HAS_MATPLOTLIB:
                 try:
@@ -525,20 +525,6 @@ def main():
                         plt.tight_layout()
                         plt.savefig('latent_space.png', dpi=150)
                         print("Saved latent_space.png")
-
-                    with torch.no_grad():
-                        x = torch.stack(hmc.field_samples[:min(64, len(hmc.field_samples))]).to(torch.float64)
-                        x_hat = geometry.decoder(geometry.encoder(x))
-                        recon_error = torch.mean((x_hat - x) ** 2, dim=1)
-
-                    plt.figure(figsize=(6, 4))
-                    plt.plot(recon_error.numpy())
-                    plt.title('Reconstruction Error per Sample')
-                    plt.xlabel('Sample')
-                    plt.ylabel('MSE')
-                    plt.tight_layout()
-                    plt.savefig('reconstruction_error.png', dpi=120)
-                    print("Saved reconstruction_error.png")
                 except Exception as e:
                     print(f"Plot error: {e}")
 
