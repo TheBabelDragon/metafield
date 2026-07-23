@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.34
+meta_field_distributed.py v1.35
 
-Final night improvements:
-- Made system summary interval configurable (--summary-interval)
-- Continued hybrid readiness
+Memory + Emergence expansion:
+- Interestingness score in episodic memory
+- Improved prioritization driven by curiosity signals
+- Richer continuous-mode summaries showing interestingness
 """
 
 from __future__ import annotations
@@ -70,11 +71,11 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.34")
+    print("  MetaField Distributed v1.35 (Memory + Emergence)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + PREDICTION]")
+        print("   [DIAGNOSTIC + MEMORY + PREDICTION + INTERESTINGNESS]")
     print()
 
 
@@ -416,6 +417,8 @@ def main():
                     delta_h=res["delta_h"],
                     accepted=res["accepted"],
                 )
+                # Initial priority / interestingness (will be refined after prediction)
+                exp.update_priority(prediction_error=0.0)
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
@@ -437,7 +440,12 @@ def main():
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
 
-                # Configurable periodic system summary
+                    # Update priorities of the sampled batch with real prediction error
+                    pred_err = float(pred_loss.item())
+                    for e in batch:
+                        e.update_priority(prediction_error=pred_err)
+
+                # Configurable periodic system summary with interestingness
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
                     recent_pred_loss = None
@@ -460,7 +468,13 @@ def main():
                     elif mem_stats.get('size', 0) < 20:
                         health = "Building memory..."
 
-                    print(f"[Summary @ {t}] Health: {health} | Mem: {mem_stats.get('size', 0)} | AvgPrio: {mem_stats.get('avg_priority', 0):.2f}", end="")
+                    print(
+                        f"[Summary @ {t}] Health: {health} | "
+                        f"Mem: {mem_stats.get('size', 0)} | "
+                        f"AvgPrio: {mem_stats.get('avg_priority', 0):.2f} | "
+                        f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f}",
+                        end=""
+                    )
                     if recent_pred_loss is not None:
                         print(f" | PredLoss: {recent_pred_loss:.2e}")
                     else:
