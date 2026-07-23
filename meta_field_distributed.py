@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.37
+meta_field_distributed.py v1.38
 
-Adaptive exploration driven by interestingness (self-regulating curiosity).
+Enriched interestingness signal (now includes geometry reconstruction error).
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.37 (Adaptive Curiosity)")
+    print("  MetaField Distributed v1.38 (Enriched Curiosity)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -408,13 +408,23 @@ def main():
                 with torch.no_grad():
                     z = geometry.encode(hmc.field_samples[-1])
 
+                # Compute reconstruction error for the latest sample
+                recon_error = 0.0
+                try:
+                    with torch.no_grad():
+                        x = hmc.field_samples[-1].to(torch.float64).unsqueeze(0)
+                        x_hat = geometry.decoder(geometry.encoder(x))
+                        recon_error = float(torch.mean((x_hat - x) ** 2).item())
+                except Exception:
+                    recon_error = 0.0
+
                 exp = EpisodicExperience(
                     latent=z,
                     action=hmc.action_history[-1] if hmc.action_history else 0.0,
                     delta_h=res["delta_h"],
                     accepted=res["accepted"],
                 )
-                exp.update_priority(prediction_error=0.0)
+                exp.update_priority(prediction_error=0.0, reconstruction_error=recon_error)
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
@@ -438,7 +448,7 @@ def main():
 
                     pred_err = float(pred_loss.item())
                     for e in batch:
-                        e.update_priority(prediction_error=pred_err)
+                        e.update_priority(prediction_error=pred_err, reconstruction_error=recon_error)
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
