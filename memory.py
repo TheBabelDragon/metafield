@@ -5,7 +5,8 @@ memory.py
 Episodic memory system with prioritization and interestingness.
 
 Designed for modularity and future Aurora integration.
-This version supports stronger emergence signals via interestingness-biased sampling.
+Supports adaptive exploration driven by average interestingness
+(self-regulating curiosity loop).
 """
 
 from typing import List, Dict, Any, Optional
@@ -45,7 +46,6 @@ class EpisodicExperience:
         delta_term = abs(self.delta_h)
         pred_term = max(0.0, prediction_error)
 
-        # Weighted combination — tunable later
         self.interestingness = (
             1.5 * curv_term +
             1.0 * delta_term +
@@ -70,50 +70,72 @@ class EpisodicMemory:
     """
     Prioritized episodic memory buffer with interestingness support.
 
-    Supports strongly interestingness-biased sampling (with a small amount of
-    pure random exploration) and basic associative retrieval.
-    Includes rich `get_stats()` for observability and Aurora sensing.
+    Features:
+    - Strong interestingness-biased sampling
+    - Adaptive exploration rate driven by average interestingness
+      (self-regulating curiosity)
+    - Basic associative retrieval
+    - Rich stats for observability / Aurora sensing
     """
 
-    def __init__(self, max_size: int = 256, exploration_rate: float = 0.15):
+    def __init__(self, max_size: int = 256,
+                 base_exploration_rate: float = 0.15,
+                 min_exploration: float = 0.05,
+                 max_exploration: float = 0.35):
         self.buffer: List[EpisodicExperience] = []
         self.max_size = max_size
-        # Fraction of samples drawn uniformly at random (encourages exploration)
-        self.exploration_rate = exploration_rate
+        self.base_exploration_rate = base_exploration_rate
+        self.min_exploration = min_exploration
+        self.max_exploration = max_exploration
 
     def add(self, exp: EpisodicExperience) -> None:
         """Add a new experience to memory."""
         self.buffer.append(exp)
         if len(self.buffer) > self.max_size:
-            # Evict lowest priority experiences
             self.buffer.sort(key=lambda e: e.priority)
             self.buffer.pop(0)
 
+    def _current_exploration_rate(self) -> float:
+        """
+        Adaptive exploration rate based on average interestingness.
+
+        - Low average interestingness → higher exploration (seek novelty)
+        - High average interestingness → lower exploration (exploit interesting regions)
+        """
+        if not self.buffer:
+            return self.base_exploration_rate
+
+        avg_interest = sum(e.interestingness for e in self.buffer) / len(self.buffer)
+
+        # Simple inverse mapping: higher interest → lower exploration
+        # Tunable constants — keep within [min_exploration, max_exploration]
+        rate = self.base_exploration_rate * (1.5 / (1.0 + avg_interest))
+        return max(self.min_exploration, min(self.max_exploration, rate))
+
     def sample(self, n: int = 16) -> List[EpisodicExperience]:
         """
-        Sample n experiences with strong interestingness bias + exploration.
+        Sample n experiences with adaptive interestingness bias + exploration.
 
-        - Most samples are drawn according to priority (which is driven by interestingness)
-        - A small fraction (`exploration_rate`) are drawn uniformly at random
-          so the system does not get stuck only replaying the same high-interest items.
+        Exploration rate is adjusted dynamically based on the current
+        average interestingness of the memory buffer.
         """
         if len(self.buffer) == 0:
             return []
         if len(self.buffer) <= n:
             return list(self.buffer)
 
-        # Decide how many samples come from pure exploration
-        n_explore = max(1, int(n * self.exploration_rate))
+        exploration_rate = self._current_exploration_rate()
+
+        n_explore = max(1, int(n * exploration_rate))
         n_biased = n - n_explore
 
-        # --- Biased sampling (interestingness / priority driven) ---
+        # Biased sampling (sharpened priority distribution)
         priorities = torch.tensor([e.priority for e in self.buffer], dtype=torch.float32)
-        # Sharpen the distribution a bit so high-interest items dominate more
         sharpened = priorities ** 1.5
         probs = sharpened / sharpened.sum()
         biased_indices = torch.multinomial(probs, n_biased, replacement=True)
 
-        # --- Pure exploration (uniform random) ---
+        # Pure exploration
         explore_indices = torch.randint(0, len(self.buffer), (n_explore,))
 
         all_indices = torch.cat([biased_indices, explore_indices])
@@ -139,10 +161,6 @@ class EpisodicMemory:
     def get_stats(self) -> Dict[str, Any]:
         """
         Return rich statistics for monitoring / sensing / emergence tracking.
-
-        Returns:
-            dict with size, avg_priority, max_priority,
-            avg_interestingness, max_interestingness
         """
         if not self.buffer:
             return {
@@ -151,6 +169,7 @@ class EpisodicMemory:
                 "max_priority": 0.0,
                 "avg_interestingness": 0.0,
                 "max_interestingness": 0.0,
+                "exploration_rate": self.base_exploration_rate,
             }
 
         priorities = [e.priority for e in self.buffer]
@@ -162,6 +181,7 @@ class EpisodicMemory:
             "max_priority": max(priorities),
             "avg_interestingness": sum(interestingnesses) / len(interestingnesses),
             "max_interestingness": max(interestingnesses),
+            "exploration_rate": self._current_exploration_rate(),
         }
 
     def __len__(self) -> int:
