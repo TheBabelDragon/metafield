@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.50
+meta_field_distributed.py v1.51
 
-Aurora environment feed (read-only): start prompt + live drive force.
-Security overlay + continuous singleton lock retained.
-Richer local stats export for sensing (file-only).
+Aurora environment feed (read-only) + continuous singleton lock.
 Attractor → geometry deformation loop active.
-Clean shutdown writes health=stopped so sensing is not lied to.
-Continuous lock is fully self-healing — no manual deletion required.
+Reliable geometry diagnostics (train loss + Fisher signals + optional curvature).
+Clean shutdown writes health=stopped. Lock is fully self-healing.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -46,7 +44,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.50"
+VERSION = "1.51"
 
 
 def get_real_lan_ip() -> str:
@@ -76,7 +74,7 @@ def print_banner(rank, world_size, role, diagnostic=False):
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + GEOMETRY DEFORMATION + AURORA FEED]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + GEOMETRY + AURORA FEED]")
     ctrl = "enabled" if control_enabled() else "disabled (set METAFIELD_CONTROL_TOKEN to enable)"
     print(f"   Control surface: {ctrl}")
     print()
@@ -331,7 +329,11 @@ class DistributedHMC:
             self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
             if self.diagnostic and self.lattice.rank == 0:
-                self.field_samples.append(self.gauge.U.detach().flatten().real[:8192])
+                # Keep a bounded sample buffer for geometry training
+                sample = self.gauge.U.detach().flatten().real[:8192].to(torch.float64)
+                self.field_samples.append(sample)
+                if len(self.field_samples) > 64:
+                    self.field_samples = self.field_samples[-64:]
 
         self.action_history.append(action1)
         self.delta_h_history.append(delta_h)
@@ -352,7 +354,6 @@ def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
 
 
 def _compute_health(mem_stats, att_stats, recent_pred_loss, acceptance_rate, recent_abs_dh, geometry_loss):
-    """Produce a compact health string from multiple signals."""
     if mem_stats.get("size", 0) < 20:
         return "Building memory..."
     if recent_pred_loss is not None and recent_pred_loss > 0.15:
@@ -409,9 +410,10 @@ def main():
     attractor_dyn = AttractorDynamics() if (args.diagnostic and rank == 0) else None
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
-    geometry = None
-    last_geometry_loss = None
-    last_curvature = None
+    geometry: Optional[LearnedInformationGeometry] = None
+    last_geometry_loss: Optional[float] = None
+    last_curvature: Optional[float] = None
+    last_geom_diag: Dict[str, float] = {}
 
     drive = apply_drive(aurora, memory, attractor_dyn)
     if drive is not None:
@@ -441,6 +443,7 @@ def main():
                         latent_dim=8,
                         attractor_weight=0.4,
                     )
+                    print(f"[geometry] Initialized (input_dim={hmc.field_samples[0].shape[0]}, latent_dim=8)")
 
                 with torch.no_grad():
                     z = geometry.encode(hmc.field_samples[-1])
@@ -448,14 +451,14 @@ def main():
                 recon_error = 0.0
                 try:
                     with torch.no_grad():
-                        x = hmc.field_samples[-1].to(torch.float64).unsqueeze(0)
+                        x = hmc.field_samples[-1].to(torch.float64).reshape(1, -1)
                         x_hat = geometry.decoder(geometry.encoder(x))
                         recon_error = float(torch.mean((x_hat - x) ** 2).item())
                 except Exception:
                     pass
 
                 exp = EpisodicExperience(
-                    latent=z,
+                    latent=z.detach(),
                     action=hmc.action_history[-1] if hmc.action_history else 0.0,
                     delta_h=res["delta_h"],
                     accepted=res["accepted"],
@@ -464,30 +467,35 @@ def main():
                 memory.add(exp)
 
                 # --- Core intelligence loop (every 25 trajectories) ---
-                if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
+                if len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(24)
 
-                    for e in batch:
-                        if e.interestingness > interest_gate:
-                            attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
-                    attractor_dyn.step()
+                    if attractor_dyn is not None:
+                        for e in batch:
+                            if e.interestingness > interest_gate:
+                                attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
+                        attractor_dyn.step()
 
+                    # Train predictor
+                    if predictor is not None:
+                        recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
+                        x_batch = torch.stack([s.reshape(-1) for s in recent]).to(torch.float64)
+                        z_batch = geometry.encoder(x_batch)
+                        actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
+                        target_mean, target_std = actions.mean(), actions.std() + 1e-6
+                        target = ((actions - target_mean) / target_std).unsqueeze(1)
+                        pred = predictor(z_batch)
+                        pred_loss = torch.mean((pred - target) ** 2)
+                        predictor_optimizer.zero_grad()
+                        pred_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+                        predictor_optimizer.step()
+                        for e in batch:
+                            e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
+
+                    # Train geometry (attractor-guided)
                     recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
-                    x_batch = torch.stack(recent).to(torch.float64)
-                    z_batch = geometry.encode(x_batch)
-                    actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
-                    target_mean, target_std = actions.mean(), actions.std() + 1e-6
-                    target = ((actions - target_mean) / target_std).unsqueeze(1)
-                    pred = predictor(z_batch)
-                    pred_loss = torch.mean((pred - target) ** 2)
-                    predictor_optimizer.zero_grad()
-                    pred_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-                    predictor_optimizer.step()
-                    for e in batch:
-                        e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
-
-                    landscape = attractor_dyn.get_landscape()
+                    landscape = attractor_dyn.get_landscape() if attractor_dyn is not None else []
                     if len(recent) >= 4:
                         last_geometry_loss = geometry.train_on_batch(
                             recent,
@@ -495,27 +503,43 @@ def main():
                             attractors=landscape if landscape else None,
                         )
 
-                    if t % 100 == 0 and last_geometry_loss is not None:
-                        try:
-                            with torch.no_grad():
-                                z_probe = geometry.encode(hmc.field_samples[-1])
-                            last_curvature = geometry.scalar_curvature(z_probe)
-                        except Exception:
-                            last_curvature = None
+                    # Cheap Fisher diagnostics every intelligence cycle
+                    try:
+                        last_geom_diag = geometry.geometry_diagnostics(z)
+                    except Exception as e:
+                        print(f"[geometry] diagnostics failed: {type(e).__name__}: {e}")
+
+                    # Full curvature less often (expensive)
+                    if t % 100 == 0:
+                        last_curvature = geometry.scalar_curvature(z, n_points=4)
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
-                    att_stats = attractor_dyn.get_stats()
+                    att_stats = attractor_dyn.get_stats() if attractor_dyn is not None else {}
                     recent_pred_loss = None
                     if predictor is not None and len(memory.buffer) > 8:
-                        recent = hmc.field_samples[-min(12, len(hmc.field_samples)):]
-                        x_batch = torch.stack(recent).to(torch.float64)
-                        z_batch = geometry.encode(x_batch)
-                        actions = torch.tensor([e.action for e in memory.sample(12)], dtype=torch.float64)
-                        tm, ts = actions.mean(), actions.std() + 1e-6
-                        target = ((actions - tm) / ts).unsqueeze(1)
-                        with torch.no_grad():
-                            recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
+                        try:
+                            recent = hmc.field_samples[-min(12, len(hmc.field_samples)):]
+                            x_batch = torch.stack([s.reshape(-1) for s in recent]).to(torch.float64)
+                            z_batch = geometry.encoder(x_batch)
+                            actions = torch.tensor([e.action for e in memory.sample(12)], dtype=torch.float64)
+                            tm, ts = actions.mean(), actions.std() + 1e-6
+                            target = ((actions - tm) / ts).unsqueeze(1)
+                            with torch.no_grad():
+                                recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
+                        except Exception:
+                            pass
+
+                    # Refresh cheap geometry diagnostics at summary time too
+                    if geometry is not None and len(hmc.field_samples) > 0:
+                        try:
+                            with torch.no_grad():
+                                z_sum = geometry.encode(hmc.field_samples[-1])
+                            last_geom_diag = geometry.geometry_diagnostics(z_sum)
+                            if last_geometry_loss is None and geometry.last_loss is not None:
+                                last_geometry_loss = geometry.last_loss
+                        except Exception:
+                            pass
 
                     recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
                     recent_abs_dh = sum(abs(d) for d in recent_dh) / max(1, len(recent_dh))
@@ -539,7 +563,9 @@ def main():
                     )
                     if last_geometry_loss is not None:
                         print(f" | GeomLoss: {last_geometry_loss:.3e}", end="")
-                    if last_curvature is not None:
+                    if last_geom_diag.get("metric_logdet") is not None and not math.isnan(last_geom_diag.get("metric_logdet", float("nan"))):
+                        print(f" | logdetG: {last_geom_diag['metric_logdet']:.2f}", end="")
+                    if last_curvature is not None and not math.isnan(last_curvature):
                         print(f" | R={last_curvature:.3e}", end="")
                     if recent_pred_loss is not None:
                         print(f" | PredLoss: {recent_pred_loss:.2e}", end="")
@@ -547,7 +573,7 @@ def main():
 
                     if args.export_stats:
                         write_local_stats({
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "version": VERSION,
                             "traj": t,
                             "health": health,
@@ -565,6 +591,9 @@ def main():
                                 "recon_error": recon_error,
                                 "train_loss": last_geometry_loss,
                                 "scalar_curvature": last_curvature,
+                                "metric_trace": last_geom_diag.get("metric_trace"),
+                                "metric_logdet": last_geom_diag.get("metric_logdet"),
+                                "metric_condition": last_geom_diag.get("metric_condition"),
                             },
                             "aurora": aurora.get_stats() if aurora else {},
                             "control_enabled": control_enabled(),
@@ -581,8 +610,6 @@ def main():
 
     finally:
         if cont_lock is not None:
-            # Release is correct. Leaving the lock held would block future runs.
-            # Acquire path is fully self-healing — no manual deletion needed.
             cont_lock.release(write_stopped_stats=True)
             if rank == 0:
                 print("[Security] Continuous lock released (clean shutdown signaled).")
