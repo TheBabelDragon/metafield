@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.49
+meta_field_distributed.py v1.50
 
 Aurora environment feed (read-only): start prompt + live drive force.
 Security overlay + continuous singleton lock retained.
 Richer local stats export for sensing (file-only).
 Attractor → geometry deformation loop active.
 Clean shutdown writes health=stopped so sensing is not lied to.
+Continuous lock is fully self-healing — no manual deletion required.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.49"
+VERSION = "1.50"
 
 
 def get_real_lan_ip() -> str:
@@ -466,13 +467,11 @@ def main():
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(24)
 
-                    # Reinforce attractors from high-interestingness experiences
                     for e in batch:
                         if e.interestingness > interest_gate:
                             attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
                     attractor_dyn.step()
 
-                    # Train predictor
                     recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
@@ -488,7 +487,6 @@ def main():
                     for e in batch:
                         e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
 
-                    # Close the attractor → geometry deformation loop
                     landscape = attractor_dyn.get_landscape()
                     if len(recent) >= 4:
                         last_geometry_loss = geometry.train_on_batch(
@@ -497,7 +495,6 @@ def main():
                             attractors=landscape if landscape else None,
                         )
 
-                    # Occasional curvature probe (expensive)
                     if t % 100 == 0 and last_geometry_loss is not None:
                         try:
                             with torch.no_grad():
@@ -584,9 +581,8 @@ def main():
 
     finally:
         if cont_lock is not None:
-            # Release is correct and necessary. Leaving the lock held would
-            # block future continuous runs. On clean release we also write
-            # health="stopped" so sensing consumers are not left with zombie data.
+            # Release is correct. Leaving the lock held would block future runs.
+            # Acquire path is fully self-healing — no manual deletion needed.
             cont_lock.release(write_stopped_stats=True)
             if rank == 0:
                 print("[Security] Continuous lock released (clean shutdown signaled).")

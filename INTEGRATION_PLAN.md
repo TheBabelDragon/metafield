@@ -1,15 +1,18 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.49**
+**Updated for v1.50**
 
 ---
 
-## Current status (v1.49)
+## Current status (v1.50)
 
 ### Done
 - Soft expandable episodic memory + force-based attractors + homeostasis + adaptive basins
 - Continuous singleton lock (duplicate continuous prohibited)
-  - Acquire recovers from stale locks (dead PID)
+  - Acquire recovers from dead / corrupt / unreadable locks automatically
+  - **No manual file deletion required**
+  - Escape hatch: `METAFIELD_FORCE_UNLOCK=1` (still no `rm` needed)
+  - Cleaner runtime path selection (`METAFIELD_RUNTIME_DIR` → `XDG_RUNTIME_DIR` → `/tmp`)
   - Release on clean exit is intentional and correct
   - Clean release also writes `health="stopped"` so sensing is not left with zombie data
 - Control surface fail-closed (`METAFIELD_CONTROL_TOKEN`)
@@ -27,7 +30,7 @@
 - **Attractor → geometry deformation loop is active**
   - High-interestingness experiences reinforce attractors
   - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
-  - Attractor influence weight increased to 0.4
+  - Attractor influence weight = 0.4
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels
@@ -39,7 +42,17 @@
 ## Continuous lock design note
 
 **Releasing the lock on clean exit is correct.**  
-Leaving it held would block the next continuous run until someone manually deleted a stale file. The acquire path already detects dead PIDs and cleans them. The only case that leaves a stale lock is hard kill (SIGKILL); the next acquire recovers automatically.
+Leaving it held would block the next continuous run.
+
+**Manual deletion is never required.** The acquire path:
+1. Detects dead PIDs and cleans automatically
+2. Treats corrupt / unreadable lock files as stale and cleans them
+3. Offers `METAFIELD_FORCE_UNLOCK=1` as an escape hatch if you are certain a process is gone (still no `rm`)
+
+Runtime path priority:
+1. `METAFIELD_RUNTIME_DIR` (explicit)
+2. `$XDG_RUNTIME_DIR/metafield` (Linux user runtime)
+3. `/tmp/metafield` (fallback)
 
 On clean release we also write a final stats snapshot with `health="stopped"` so sensing consumers do not keep reporting stale live data.
 
