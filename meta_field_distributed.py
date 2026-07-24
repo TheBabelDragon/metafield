@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.57
+meta_field_distributed.py v1.58
 
-Fermion HMC defaults retuned for acceptance efficiency:
-  step=2.5e-4, leapfrog=60, τ=0.015  (from observed |dH|~1-6 at 5e-4)
+Nightcap: HMC throughput + geometry-aware episodic interestingness.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.57"
+VERSION = "1.58"
 HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
@@ -99,10 +98,8 @@ def parse_args():
     p.add_argument("--summary-interval", type=int, default=30)
     p.add_argument("--export-stats", action="store_true", default=False)
     p.add_argument("--aurora-feed", action="store_true", default=False)
-    p.add_argument("--hmc-step", type=float, default=None,
-                   help="HMC step size (default: 2.5e-4 fermions / 1.2e-2 quenched)")
-    p.add_argument("--hmc-leapfrog", type=int, default=None,
-                   help="Leapfrog steps (default: 60 fermions / 20 quenched)")
+    p.add_argument("--hmc-step", type=float, default=None)
+    p.add_argument("--hmc-leapfrog", type=int, default=None)
     return p.parse_args()
 
 
@@ -402,7 +399,6 @@ class DistributedHMC:
             f_norm = float(torch.sqrt(torch.sum((F.conj() * F).real)).item())
             print(f"  [Diag] |F|≈{f_norm:.4e}  step={eps}  leapfrog={cfg.hmc_n_leapfrog}  τ={eps * cfg.hmc_n_leapfrog:.4f}")
 
-        # Minus sign: dP/dt = -∂S → dK ≈ -dS
         P = P - 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
@@ -506,11 +502,10 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
-    # Tuned from observed |dH|~1-6 at ε=5e-4 → target |dH|≲1
-    # Integrator error ~ O(ε²); ε' = ε/2 → |dH|' ≈ |dH|/4
+    # Nightcap defaults: slightly smaller step for ~50% accept, keep τ useful
     if args.include_fermions:
-        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 60
-        step_size = args.hmc_step if args.hmc_step is not None else 0.00025
+        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 75
+        step_size = args.hmc_step if args.hmc_step is not None else 0.0002
     else:
         leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
         step_size = args.hmc_step if args.hmc_step is not None else 0.012
@@ -562,7 +557,6 @@ def main():
         print(f"  lattice={config.L}^4  leapfrog={leapfrog}  step={step_size}  τ={leapfrog * step_size:.4f}")
         if config.include_fermions:
             print(f"  CG tol_md={config.cg_tol_md}  tol_action={config.cg_tol_action}")
-            print(f"  target: |dH|≲1 → accept ~50-70%")
         print()
 
     interrupted = False
@@ -606,22 +600,31 @@ def main():
                 except Exception:
                     pass
 
+                # Geometry-aware interestingness: pass curvature when known
+                curv_val = float(last_curvature) if (
+                    last_curvature is not None and math.isfinite(last_curvature)
+                ) else 0.0
+
                 exp = EpisodicExperience(
                     latent=z.detach(),
                     action=hmc.action_history[-1] if hmc.action_history else 0.0,
                     delta_h=res["delta_h"] if math.isfinite(res["delta_h"]) else 0.0,
                     accepted=res["accepted"],
+                    curvature=curv_val,
                 )
                 exp.update_priority(reconstruction_error=recon_error)
                 memory.add(exp)
 
-                if len(memory.buffer) > 8 and t % 25 == 0:
+                # Intelligence cycle every 20 traj once memory is warm
+                if len(memory.buffer) > 8 and t % 20 == 0:
                     try:
                         batch = memory.sample(24)
                         if attractor_dyn is not None:
                             for e in batch:
                                 if e.interestingness > interest_gate:
-                                    attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
+                                    attractor_dyn.reinforce_from_latent(
+                                        e.latent, interestingness=e.interestingness
+                                    )
                             attractor_dyn.step()
 
                         if predictor is not None and predictor_optimizer is not None and batch:
@@ -644,13 +647,17 @@ def main():
                                     predictor_optimizer.step()
                                     pl = float(pred_loss.item())
                                     for e in batch:
-                                        e.update_priority(prediction_error=pl, reconstruction_error=recon_error)
+                                        e.update_priority(
+                                            prediction_error=pl,
+                                            reconstruction_error=recon_error,
+                                        )
 
                         recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                         landscape = attractor_dyn.get_landscape() if attractor_dyn is not None else []
                         if len(recent) >= 4:
                             last_geometry_loss = geometry.train_on_batch(
-                                recent, epochs=12, attractors=landscape if landscape else None,
+                                recent, epochs=12,
+                                attractors=landscape if landscape else None,
                             )
 
                         try:
@@ -658,7 +665,8 @@ def main():
                         except Exception as e:
                             print(f"[geometry] diagnostics failed: {type(e).__name__}: {e}")
 
-                        if t % 100 == 0:
+                        # Curvature probe every other intelligence cycle
+                        if t % 40 == 0:
                             last_curvature = geometry.scalar_curvature(z, n_points=4)
 
                     except Exception as e:
@@ -683,7 +691,9 @@ def main():
                                 tm, ts = actions.mean(), actions.std() + 1e-6
                                 target = ((actions - tm) / ts).unsqueeze(1)
                                 with torch.no_grad():
-                                    recent_pred_loss = float(torch.mean((predictor(z_batch) - target) ** 2).item())
+                                    recent_pred_loss = float(
+                                        torch.mean((predictor(z_batch) - target) ** 2).item()
+                                    )
                         except Exception:
                             pass
 
@@ -699,7 +709,10 @@ def main():
 
                     recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
                     finite_dh = [d for d in recent_dh if math.isfinite(d)]
-                    recent_abs_dh = sum(abs(d) for d in finite_dh) / max(1, len(finite_dh)) if finite_dh else 0.0
+                    recent_abs_dh = (
+                        sum(abs(d) for d in finite_dh) / max(1, len(finite_dh))
+                        if finite_dh else 0.0
+                    )
                     acceptance_rate = res["acceptance_rate"]
 
                     health = _compute_health(
