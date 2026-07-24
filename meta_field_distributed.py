@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.45
+meta_field_distributed.py v1.46
 
-Continuous singleton lock + security overlay foundations.
-Duplicate continuous path is prohibited.
+Aurora environment feed (read-only): start prompt + live drive force.
+Security overlay + continuous singleton lock retained.
 """
 
 from __future__ import annotations
@@ -13,11 +13,10 @@ import sys
 import math
 import socket
 import argparse
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 
 try:
     import matplotlib.pyplot as plt
@@ -29,12 +28,8 @@ from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
 from geometry import LearnedInformationGeometry
 from attractors import AttractorDynamics
-from security import (
-    ContinuousLock,
-    ContinuousLockError,
-    write_local_stats,
-    control_enabled,
-)
+from security import ContinuousLock, ContinuousLockError, write_local_stats, control_enabled
+from aurora_feed import AuroraFeed
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -45,7 +40,6 @@ from meta_field_sim_torch import (
     random_su_n_hermitian,
     euclidean_gamma_matrices,
     gamma5,
-    cg_solve,
 )
 
 
@@ -56,7 +50,7 @@ def get_real_lan_ip() -> str:
             ip = info[4][0]
             if not ip.startswith("127."):
                 return ip
-    except:
+    except Exception:
         pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,18 +59,18 @@ def get_real_lan_ip() -> str:
         s.close()
         if not ip.startswith("127."):
             return ip
-    except:
+    except Exception:
         pass
     return "127.0.0.1"
 
 
-def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
+def print_banner(rank, world_size, role, diagnostic=False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.45 (Security Overlay + Continuous Lock)")
+    print("  MetaField Distributed v1.46 (Aurora Environment Feed)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + HOMEOSTASIS + BASINS]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + AURORA FEED]")
     ctrl = "enabled" if control_enabled() else "disabled (set METAFIELD_CONTROL_TOKEN to enable)"
     print(f"   Control surface: {ctrl}")
     print()
@@ -94,27 +88,26 @@ def parse_args():
     def parse_bool(v):
         if isinstance(v, bool):
             return v
-        if v.lower() in ('true', '1', 'yes', 'y'):
+        if v.lower() in ("true", "1", "yes", "y"):
             return True
-        if v.lower() in ('false', '0', 'no', 'n'):
+        if v.lower() in ("false", "0", "no", "n"):
             return False
         return True
 
-    p.add_argument("--include-fermions", type=parse_bool, nargs='?', const=True, default=True)
+    p.add_argument("--include-fermions", type=parse_bool, nargs="?", const=True, default=True)
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
     p.add_argument("--continuous", action="store_true", default=False)
-    p.add_argument("--summary-interval", type=int, default=50,
-                   help="How often to print system summary in continuous mode (default: 50)")
-    p.add_argument("--export-stats", action="store_true", default=False,
-                   help="Write local stats.json snapshot on each summary (file-only, no network)")
+    p.add_argument("--summary-interval", type=int, default=50)
+    p.add_argument("--export-stats", action="store_true", default=False)
+    p.add_argument("--aurora-feed", action="store_true", default=False,
+                   help="Read Aurora sensing as start prompt + live drive force (read-only)")
     return p.parse_args()
 
 
 def init_distributed(args):
     role = args.role
     world_size = args.world_size
-
     if role == "control":
         rank = 0
     elif role == "worker":
@@ -122,34 +115,22 @@ def init_distributed(args):
     else:
         rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
 
-    if args.master_addr != "auto":
-        master_addr = args.master_addr
-    else:
-        master_addr = get_real_lan_ip()
-
+    master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
     master_port = args.master_port
 
     if world_size > 1:
         if master_addr.startswith("127."):
-            print("\n[CRITICAL ERROR] Your system is resolving to localhost.")
-            print("Please comment out 127.0.1.1 in /etc/hosts on both machines.")
+            print("\n[CRITICAL ERROR] Resolving to localhost. Fix /etc/hosts.")
             sys.exit(1)
-
-        print(f"[Distributed] Initializing process group... (role={role}, rank={rank}, world_size={world_size}, master={master_addr})")
-
+        print(f"[Distributed] Initializing... rank={rank} world_size={world_size} master={master_addr}")
         try:
-            dist.init_process_group(
-                backend=args.backend,
-                init_method="env://",
-                rank=rank,
-                world_size=world_size
-            )
-            print("[Distributed] Process group initialized successfully.")
+            dist.init_process_group(backend=args.backend, init_method="env://", rank=rank, world_size=world_size)
+            print("[Distributed] OK")
         except Exception as e:
-            print(f"[Distributed] Failed to initialize process group: {e}")
+            print(f"[Distributed] Failed: {e}")
             sys.exit(1)
 
-    print_banner(rank, world_size, role, master_addr, master_port, args.diagnostic)
+    print_banner(rank, world_size, role, args.diagnostic)
     return rank, world_size, master_addr, master_port
 
 
@@ -176,16 +157,17 @@ class DistributedLattice:
         self.dtype = config.dtype
 
     def _halo_exchange(self, tensor, tag_base=42):
-        if self.world_size == 1: return
+        if self.world_size == 1:
+            return
         left, right = self.left_neighbor, self.right_neighbor
         recv_l = dist.irecv(tensor.narrow(0, 0, 1).contiguous(), src=left, tag=tag_base)
-        recv_r = dist.irecv(tensor.narrow(0, self.local_L + 1, 1).contiguous(), src=right, tag=tag_base+1)
-        send_l = dist.isend(tensor.narrow(0, 1, 1).contiguous(), dst=left, tag=tag_base+1)
+        recv_r = dist.irecv(tensor.narrow(0, self.local_L + 1, 1).contiguous(), src=right, tag=tag_base + 1)
+        send_l = dist.isend(tensor.narrow(0, 1, 1).contiguous(), dst=left, tag=tag_base + 1)
         send_r = dist.isend(tensor.narrow(0, self.local_L, 1).contiguous(), dst=right, tag=tag_base)
         recv_l.wait(); recv_r.wait(); send_l.wait(); send_r.wait()
 
-    def update_halo_gauge(self, U): self._halo_exchange(U, 100)
-    def update_halo_fermion(self, psi): self._halo_exchange(psi, 200)
+    def update_halo_gauge(self, U):
+        self._halo_exchange(U, 100)
 
     def shift(self, field, axis, direction):
         if axis != 0 or self.world_size == 1:
@@ -194,7 +176,8 @@ class DistributedLattice:
         return torch.roll(field, shifts=-direction, dims=0)
 
     def global_sum(self, x):
-        if self.world_size == 1: return x
+        if self.world_size == 1:
+            return x
         s = x.clone()
         dist.all_reduce(s, op=dist.ReduceOp.SUM)
         return s
@@ -211,11 +194,12 @@ class DistributedGaugeField:
         self.U = expm_anti_hermitian(project_traceless_antihermitian(X)) @ eye
 
     def plaquette_traces(self, U=None):
-        if U is None: U = self.U
+        if U is None:
+            U = self.U
         lat = self.lattice
         traces = []
         for mu in range(4):
-            for nu in range(mu+1, 4):
+            for nu in range(mu + 1, 4):
                 U_mu = U[..., mu, :, :]
                 U_nu_xpm = lat.shift(U[..., nu, :, :], mu, +1)
                 U_mu_xpn = lat.shift(U_mu, nu, +1)
@@ -225,11 +209,13 @@ class DistributedGaugeField:
         return lat.global_sum(torch.stack(traces).sum()) / lat.global_volume
 
     def wilson_action(self, U=None):
-        if U is None: U = self.U
+        if U is None:
+            U = self.U
         return self.config.beta * self.lattice.global_volume * (1.0 - self.plaquette_traces(U))
 
     def force(self, U=None):
-        if U is None: U = self.U
+        if U is None:
+            U = self.U
         U_req = U.detach().clone().requires_grad_(True)
         S = self.wilson_action(U_req)
         grad = torch.autograd.grad(S, U_req)[0]
@@ -255,16 +241,13 @@ class DistributedWilsonDiracOperator:
             psi_fwd = lat.shift(psi, mu, +1)
             psi_back = lat.shift(psi, mu, -1)
             out = out - 0.5 * (
-                torch.einsum('st,...ti->...si', self.r_minus[mu], torch.einsum('...ij,...sj->...si', U_mu, psi_fwd)) +
-                torch.einsum('st,...ti->...si', self.r_plus[mu], torch.einsum('...ij,...sj->...si', dagger(U_mu_back), psi_back))
+                torch.einsum("st,...ti->...si", self.r_minus[mu], torch.einsum("...ij,...sj->...si", U_mu, psi_fwd))
+                + torch.einsum("st,...ti->...si", self.r_plus[mu], torch.einsum("...ij,...sj->...si", dagger(U_mu_back), psi_back))
             )
         return out
 
     def apply_dagger(self, psi, U):
-        return torch.einsum('st,...ti->...si', self.g5, self.apply(torch.einsum('st,...ti->...si', self.g5, psi), U))
-
-    def normal_op(self, psi, U):
-        return self.apply_dagger(self.apply(psi, U), U)
+        return torch.einsum("st,...ti->...si", self.g5, self.apply(torch.einsum("st,...ti->...si", self.g5, psi), U))
 
 
 class DistributedPseudofermionField:
@@ -330,7 +313,7 @@ class DistributedHMC:
         delta_h = float((H1 - H0).real)
 
         if self.diagnostic and self.lattice.rank == 0:
-            print(f"  [Diag] End Action   = {action1:.4f} | raw ΔH = {delta_h:+.4f}")
+            print(f"  [Diag] End Action   = {action1:.4f} | raw dH = {delta_h:+.4f}")
 
         accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
         accepted = torch.rand((), generator=self.generator).item() < accept_prob
@@ -340,23 +323,31 @@ class DistributedHMC:
             self.n_accepted += 1
             self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
-
             if self.diagnostic and self.lattice.rank == 0:
-                flat = self.gauge.U.detach().flatten().real[:8192]
-                self.field_samples.append(flat)
+                self.field_samples.append(self.gauge.U.detach().flatten().real[:8192])
 
         self.action_history.append(action1)
         self.delta_h_history.append(delta_h)
         self.accepted_history.append(accepted)
-
         return {"delta_h": delta_h, "accepted": accepted, "acceptance_rate": self.n_accepted / max(1, self.n_total)}
+
+
+def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
+    if feed is None:
+        return None
+    snap = feed.poll()
+    drive = feed.drive_force(snap)
+    if memory is not None:
+        memory.set_drive_scale(drive.exploration_scale)
+    if attractor_dyn is not None:
+        attractor_dyn.set_drive_scale(drive.energy_scale)
+    return drive
 
 
 def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
 
-    # --- Duplicate continuous path prohibition ---
     cont_lock = None
     if args.continuous and rank == 0:
         cont_lock = ContinuousLock()
@@ -365,24 +356,22 @@ def main():
             print("[Security] Continuous singleton lock acquired.")
         except ContinuousLockError as e:
             print(f"\n[Security] {e}")
-            print("Refusing to start a second continuous instance.")
             sys.exit(1)
 
-    if args.continuous:
-        hmc_trajectories = 10**9
-    else:
-        hmc_trajectories = 25
+    aurora = None
+    interest_gate = 0.8
+    drive = None
+    if args.aurora_feed and rank == 0:
+        aurora = AuroraFeed(enabled=True)
+        print(aurora.start_prompt())
+
+    hmc_trajectories = 10**9 if args.continuous else 25
 
     config = ConfigV2(
-        L=4,
-        beta=5.5,
-        hmc_n_leapfrog=20,
-        hmc_step_size=0.012,
+        L=4, beta=5.5, hmc_n_leapfrog=20, hmc_step_size=0.012,
         hmc_trajectories=hmc_trajectories,
         include_fermions=args.include_fermions,
-        seed=42 + rank,
-        device="cpu",
-        dtype=torch.complex128,
+        seed=42 + rank, device="cpu", dtype=torch.complex128,
     )
 
     torch.manual_seed(config.seed)
@@ -398,12 +387,15 @@ def main():
     attractor_dyn = AttractorDynamics() if (args.diagnostic and rank == 0) else None
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
-
     geometry = None
 
+    drive = apply_drive(aurora, memory, attractor_dyn)
+    if drive is not None:
+        interest_gate = max(0.5, min(1.2, 0.8 + drive.interest_bias))
+
     if rank == 0:
-        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED (gauge only)"
-        run_mode = "CONTINUOUS (Ctrl+C to stop)" if args.continuous else f"{hmc_trajectories} trajectories"
+        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED"
+        run_mode = "CONTINUOUS" if args.continuous else f"{hmc_trajectories} traj"
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
 
     interrupted = False
@@ -413,10 +405,14 @@ def main():
         for t in range(config.hmc_trajectories):
             res = hmc.trajectory()
 
+            if aurora is not None and rank == 0 and t > 0 and t % summary_interval == 0:
+                drive = apply_drive(aurora, memory, attractor_dyn)
+                if drive is not None:
+                    interest_gate = max(0.5, min(1.2, 0.8 + drive.interest_bias))
+
             if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
                 if geometry is None:
-                    input_dim = hmc.field_samples[0].shape[0]
-                    geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
+                    geometry = LearnedInformationGeometry(input_dim=hmc.field_samples[0].shape[0], latent_dim=8)
 
                 with torch.no_grad():
                     z = geometry.encode(hmc.field_samples[-1])
@@ -428,7 +424,7 @@ def main():
                         x_hat = geometry.decoder(geometry.encoder(x))
                         recon_error = float(torch.mean((x_hat - x) ** 2).item())
                 except Exception:
-                    recon_error = 0.0
+                    pass
 
                 exp = EpisodicExperience(
                     latent=z,
@@ -436,85 +432,67 @@ def main():
                     delta_h=res["delta_h"],
                     accepted=res["accepted"],
                 )
-                exp.update_priority(prediction_error=0.0, reconstruction_error=recon_error)
+                exp.update_priority(reconstruction_error=recon_error)
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(24)
-
                     for e in batch:
-                        if e.interestingness > 0.8:
+                        if e.interestingness > interest_gate:
                             attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
-
                     attractor_dyn.step()
 
                     recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
-
                     actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
-                    target_mean = actions.mean()
-                    target_std = actions.std() + 1e-6
+                    target_mean, target_std = actions.mean(), actions.std() + 1e-6
                     target = ((actions - target_mean) / target_std).unsqueeze(1)
-
                     pred = predictor(z_batch)
                     pred_loss = torch.mean((pred - target) ** 2)
-
                     predictor_optimizer.zero_grad()
                     pred_loss.backward()
                     torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
                     predictor_optimizer.step()
-
-                    pred_err = float(pred_loss.item())
                     for e in batch:
-                        e.update_priority(prediction_error=pred_err, reconstruction_error=recon_error)
+                        e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
                     att_stats = attractor_dyn.get_stats()
                     recent_pred_loss = None
-
                     if predictor is not None and len(memory.buffer) > 8:
                         recent = hmc.field_samples[-min(12, len(hmc.field_samples)):]
                         x_batch = torch.stack(recent).to(torch.float64)
                         z_batch = geometry.encode(x_batch)
                         actions = torch.tensor([e.action for e in memory.sample(12)], dtype=torch.float64)
-                        target_mean = actions.mean()
-                        target_std = actions.std() + 1e-6
-                        target = ((actions - target_mean) / target_std).unsqueeze(1)
+                        tm, ts = actions.mean(), actions.std() + 1e-6
+                        target = ((actions - tm) / ts).unsqueeze(1)
                         with torch.no_grad():
-                            pred = predictor(z_batch)
-                            recent_pred_loss = torch.mean((pred - target) ** 2).item()
+                            recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
 
                     health = "Good"
                     if recent_pred_loss is not None and recent_pred_loss > 0.1:
                         health = "Warning (high pred loss)"
-                    elif mem_stats.get('size', 0) < 30:
+                    elif mem_stats.get("size", 0) < 30:
                         health = "Building memory..."
 
-                    energy = att_stats.get('total_energy', 0)
-                    budget = att_stats.get('energy_budget', 80)
-                    mem_size = mem_stats.get('size', 0)
-                    soft_cap = mem_stats.get('soft_capacity', 512)
-
+                    aurora_mode = drive.mode if drive is not None else "off"
                     print(
                         f"[Summary @ {t}] Health: {health} | "
-                        f"Mem: {mem_size}/{soft_cap} | "
+                        f"Mem: {mem_stats.get('size', 0)}/{mem_stats.get('soft_capacity', 512)} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
-                        f"(E={energy:.1f}/{budget:.0f}, "
-                        f"str={att_stats.get('avg_strength', 0):.2f}, "
-                        f"r={att_stats.get('avg_radius', 0):.2f}, "
-                        f"cons={att_stats.get('avg_consistency', 0):.2f}) | "
-                        f"Explore: {mem_stats.get('exploration_rate', 0):.2f}",
-                        end=""
+                        f"(E={att_stats.get('total_energy', 0):.1f}/{att_stats.get('energy_budget', 80):.0f}) | "
+                        f"Explore: {mem_stats.get('exploration_rate', 0):.2f} | "
+                        f"Aurora: {aurora_mode}",
+                        end="",
                     )
                     if recent_pred_loss is not None:
                         print(f" | PredLoss: {recent_pred_loss:.2e}")
                     else:
                         print()
 
-                    # Optional local stats export (file-only, no network)
                     if args.export_stats:
                         write_local_stats({
                             "traj": t,
@@ -522,6 +500,7 @@ def main():
                             "memory": mem_stats,
                             "attractors": att_stats,
                             "prediction": {"recent_loss": recent_pred_loss},
+                            "aurora": aurora.get_stats() if aurora else {},
                             "control_enabled": control_enabled(),
                         })
 
@@ -532,55 +511,19 @@ def main():
     except KeyboardInterrupt:
         interrupted = True
         if rank == 0:
-            print("\nInterrupted by user (Ctrl+C). Shutting down cleanly...")
+            print("\nInterrupted (Ctrl+C). Shutting down...")
 
     finally:
         if cont_lock is not None:
             cont_lock.release()
             if rank == 0:
-                print("[Security] Continuous singleton lock released.")
+                print("[Security] Continuous lock released.")
 
     if rank == 0:
         print("\nRun finished." + (" (interrupted)" if interrupted else ""))
 
-        if args.diagnostic and len(hmc.field_samples) > 10:
-            print("\n=== Learned Information Geometry (shaped by Attractor Landscape) ===")
-            input_dim = hmc.field_samples[0].shape[0]
-            geometry = LearnedInformationGeometry(input_dim=input_dim, latent_dim=8)
-
-            num_samples = len(hmc.field_samples)
-            geom_epochs = max(30, min(200, num_samples // 5))
-
-            landscape = attractor_dyn.get_landscape() if attractor_dyn else None
-            loss = geometry.train_on_batch(
-                hmc.field_samples,
-                epochs=geom_epochs,
-                attractors=landscape
-            )
-            print(f"Final AE loss after {geom_epochs} epochs: {loss:.4e}")
-            if landscape:
-                print(f"Geometry shaped by {len(landscape)} attractors")
-
-            with torch.no_grad():
-                z = geometry.encode(hmc.field_samples[-1])
-                R = geometry.scalar_curvature(z)
-            print(f"\nLatent scalar curvature: {R:.4f}")
-
-            if args.save_plots and HAS_MATPLOTLIB:
-                try:
-                    z2d, colors = geometry.get_latent_2d(hmc.field_samples)
-                    if z2d is not None:
-                        plt.figure(figsize=(7, 5))
-                        scatter = plt.scatter(z2d[:, 0], z2d[:, 1], c=colors, cmap='viridis', s=50, alpha=0.85)
-                        plt.colorbar(scatter, label='Mean |field|')
-                        plt.title('2D Latent Space')
-                        plt.tight_layout()
-                        plt.savefig('latent_space.png', dpi=150)
-                        print("Saved latent_space.png")
-                except Exception as e:
-                    print(f"Plot error: {e}")
-
     cleanup_distributed()
+
 
 if __name__ == "__main__":
     main()
