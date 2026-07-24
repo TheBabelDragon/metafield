@@ -4,7 +4,9 @@ attractors.py
 
 Force-based Attractor Dynamics with Homeostasis and Adaptive Basins.
 
-Scaled capacities for longer continuous runs.
+No rigid hard attractor count ceiling. Energy budget is the primary
+regulator; max_attractors is only a soft preference under energy pressure.
+Designed for long continuous runs.
 """
 
 from __future__ import annotations
@@ -62,16 +64,24 @@ class Attractor:
 
 
 class AttractorDynamics:
+    """
+    Force-based landscape regulated primarily by energy budget.
+
+    soft_attractor_target is a preference, not a hard wall.
+    New attractors can still nucleate; homeostasis + merge + min_strength
+    keep the landscape healthy over long runs.
+    """
+
     def __init__(self,
-                 max_attractors: int = 64,
-                 energy_budget: float = 60.0,
+                 soft_attractor_target: int = 80,
+                 energy_budget: float = 80.0,
                  merge_tolerance: float = 0.15,
                  attraction_scale: float = 0.8,
                  repulsion_scale: float = 0.4,
                  step_size: float = 0.05,
                  min_strength: float = 0.15):
         self.attractors: List[Attractor] = []
-        self.max_attractors = max_attractors
+        self.soft_attractor_target = soft_attractor_target
         self.energy_budget = energy_budget
         self.merge_tolerance = merge_tolerance
         self.attraction_scale = attraction_scale
@@ -101,7 +111,12 @@ class AttractorDynamics:
             nearest.reinforce(amount=0.4 + 0.3 * interestingness, new_position=latent)
         else:
             strength = 1.0 + 0.5 * interestingness
-            if len(self.attractors) < self.max_attractors:
+            # Prefer nucleation; only replace weakest if far over soft target
+            # and energy is also under pressure
+            over_count = len(self.attractors) >= self.soft_attractor_target
+            over_energy = self.total_energy() > self.energy_budget * 0.95
+
+            if not over_count or not over_energy:
                 self.attractors.append(Attractor(latent, strength=strength))
             else:
                 self.attractors.sort(key=lambda a: a.strength)
@@ -209,6 +224,7 @@ class AttractorDynamics:
         if not self.attractors:
             return {
                 "num_attractors": 0,
+                "soft_target": self.soft_attractor_target,
                 "avg_strength": 0.0,
                 "max_strength": 0.0,
                 "avg_radius": 0.0,
@@ -223,6 +239,7 @@ class AttractorDynamics:
         consistencies = [a.consistency for a in self.attractors]
         return {
             "num_attractors": len(self.attractors),
+            "soft_target": self.soft_attractor_target,
             "avg_strength": sum(strengths) / len(strengths),
             "max_strength": max(strengths),
             "avg_radius": sum(radii) / len(radii),

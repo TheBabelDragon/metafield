@@ -4,8 +4,9 @@ memory.py
 
 Episodic memory with interestingness and prioritization.
 
-Works together with attractors.py:
-  Field → EpisodicMemory (experiences) → AttractorDynamics (landscape) → Geometry
+No rigid hard cap. Soft expandable capacity grows with experience;
+priority-based eviction only applies under soft pressure.
+Designed for long continuous runs.
 """
 
 from typing import List, Dict, Any
@@ -54,23 +55,58 @@ class EpisodicExperience:
 
 
 class EpisodicMemory:
-    """Prioritized episodic buffer. Feeds high-interest experiences into AttractorDynamics."""
+    """
+    Prioritized episodic buffer with soft expandable capacity.
 
-    def __init__(self, max_size: int = 512,
+    - soft_capacity starts modest and grows with total experiences seen
+    - eviction only when above soft_capacity (lowest priority first)
+    - absolute_safety_limit is only a last-resort guard against runaway RAM
+    """
+
+    def __init__(self,
+                 soft_capacity: int = 512,
+                 soft_capacity_max: int = 8192,
+                 absolute_safety_limit: int = 20000,
+                 growth_every: int = 200,
+                 growth_step: int = 128,
                  base_exploration_rate: float = 0.15,
                  min_exploration: float = 0.05,
                  max_exploration: float = 0.35):
         self.buffer: List[EpisodicExperience] = []
-        self.max_size = max_size
+        self.soft_capacity = soft_capacity
+        self.soft_capacity_max = soft_capacity_max
+        self.absolute_safety_limit = absolute_safety_limit
+        self.growth_every = growth_every
+        self.growth_step = growth_step
+        self.total_added = 0
+
         self.base_exploration_rate = base_exploration_rate
         self.min_exploration = min_exploration
         self.max_exploration = max_exploration
 
     def add(self, exp: EpisodicExperience) -> None:
         self.buffer.append(exp)
-        if len(self.buffer) > self.max_size:
+        self.total_added += 1
+
+        # Soft capacity expands with experience (long-run friendly)
+        if (self.total_added % self.growth_every == 0 and
+                self.soft_capacity < self.soft_capacity_max):
+            self.soft_capacity = min(
+                self.soft_capacity_max,
+                self.soft_capacity + self.growth_step
+            )
+
+        # Priority eviction only under soft pressure
+        if len(self.buffer) > self.soft_capacity:
+            overflow = len(self.buffer) - self.soft_capacity
             self.buffer.sort(key=lambda e: e.priority)
-            self.buffer.pop(0)
+            self.buffer = self.buffer[overflow:]
+
+        # Absolute safety only (should rarely hit)
+        if len(self.buffer) > self.absolute_safety_limit:
+            overflow = len(self.buffer) - self.absolute_safety_limit
+            self.buffer.sort(key=lambda e: e.priority)
+            self.buffer = self.buffer[overflow:]
 
     def _current_exploration_rate(self) -> float:
         if not self.buffer:
@@ -107,19 +143,23 @@ class EpisodicMemory:
         if not self.buffer:
             return {
                 "size": 0,
-                "max_size": self.max_size,
+                "soft_capacity": self.soft_capacity,
+                "soft_capacity_max": self.soft_capacity_max,
                 "avg_priority": 0.0,
                 "avg_interestingness": 0.0,
                 "exploration_rate": self.base_exploration_rate,
+                "total_added": self.total_added,
             }
         priorities = [e.priority for e in self.buffer]
         interestingnesses = [e.interestingness for e in self.buffer]
         return {
             "size": len(self.buffer),
-            "max_size": self.max_size,
+            "soft_capacity": self.soft_capacity,
+            "soft_capacity_max": self.soft_capacity_max,
             "avg_priority": sum(priorities) / len(priorities),
             "avg_interestingness": sum(interestingnesses) / len(interestingnesses),
             "exploration_rate": self._current_exploration_rate(),
+            "total_added": self.total_added,
         }
 
     def __len__(self) -> int:
