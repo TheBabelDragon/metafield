@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.46
+meta_field_distributed.py v1.47
 
 Aurora environment feed (read-only): start prompt + live drive force.
 Security overlay + continuous singleton lock retained.
+Richer local stats export for sensing (file-only).
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
+VERSION = "1.47"
+
 
 def get_real_lan_ip() -> str:
     try:
@@ -66,7 +69,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank, world_size, role, diagnostic=False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.46 (Aurora Environment Feed)")
+    print(f"  MetaField Distributed v{VERSION} (Aurora Environment Feed)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -98,7 +101,8 @@ def parse_args():
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
     p.add_argument("--continuous", action="store_true", default=False)
-    p.add_argument("--summary-interval", type=int, default=50)
+    p.add_argument("--summary-interval", type=int, default=30,
+                   help="How often (in trajectories) to print system summary & export stats")
     p.add_argument("--export-stats", action="store_true", default=False)
     p.add_argument("--aurora-feed", action="store_true", default=False,
                    help="Read Aurora sensing as start prompt + live drive force (read-only)")
@@ -344,6 +348,19 @@ def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
     return drive
 
 
+def _compute_health(mem_stats, att_stats, recent_pred_loss, acceptance_rate, recent_abs_dh):
+    """Produce a compact health string from multiple signals."""
+    if mem_stats.get("size", 0) < 20:
+        return "Building memory..."
+    if recent_pred_loss is not None and recent_pred_loss > 0.15:
+        return "Warning (high pred loss)"
+    if acceptance_rate < 0.4 and recent_abs_dh is not None and recent_abs_dh > 2.0:
+        return "Warning (HMC struggling)"
+    if att_stats.get("num_attractors", 0) == 0 and mem_stats.get("size", 0) > 40:
+        return "Quiet (no attractors yet)"
+    return "Good"
+
+
 def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
@@ -471,11 +488,15 @@ def main():
                         with torch.no_grad():
                             recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
 
-                    health = "Good"
-                    if recent_pred_loss is not None and recent_pred_loss > 0.1:
-                        health = "Warning (high pred loss)"
-                    elif mem_stats.get("size", 0) < 30:
-                        health = "Building memory..."
+                    # Recent HMC health signals
+                    recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
+                    recent_abs_dh = sum(abs(d) for d in recent_dh) / max(1, len(recent_dh))
+                    acceptance_rate = res["acceptance_rate"]
+
+                    health = _compute_health(
+                        mem_stats, att_stats, recent_pred_loss,
+                        acceptance_rate, recent_abs_dh
+                    )
 
                     aurora_mode = drive.mode if drive is not None else "off"
                     print(
@@ -485,6 +506,7 @@ def main():
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
                         f"(E={att_stats.get('total_energy', 0):.1f}/{att_stats.get('energy_budget', 80):.0f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f} | "
+                        f"Accept: {acceptance_rate:.2f} | "
                         f"Aurora: {aurora_mode}",
                         end="",
                     )
@@ -495,11 +517,20 @@ def main():
 
                     if args.export_stats:
                         write_local_stats({
+                            "schema_version": 2,
+                            "version": VERSION,
                             "traj": t,
                             "health": health,
+                            "hmc": {
+                                "acceptance_rate": acceptance_rate,
+                                "recent_abs_dh": recent_abs_dh,
+                                "n_total": hmc.n_total,
+                                "n_accepted": hmc.n_accepted,
+                            },
                             "memory": mem_stats,
                             "attractors": att_stats,
                             "prediction": {"recent_loss": recent_pred_loss},
+                            "geometry": {"recon_error": recon_error},
                             "aurora": aurora.get_stats() if aurora else {},
                             "control_enabled": control_enabled(),
                         })
