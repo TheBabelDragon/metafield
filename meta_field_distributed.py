@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.53
+meta_field_distributed.py v1.54
 
-Hardened continuous path + full dynamical fermions (CG + pf force).
-Bounded histories, aligned predictor batches, non-finite guards,
-self-healing lock, attractor→geometry deformation loop.
+Fixes for 0% acceptance under dynamical fermions:
+- Correct lattice extent when world_size==1 (no spurious halo)
+- Interior-only action/kinetic when padded
+- Much smaller MD step when fermions are on
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import sys
 import math
 import socket
 import argparse
-from typing import List, Optional, Dict, Any, Callable, Tuple
+from typing import List, Optional, Dict, Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -37,7 +38,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.53"
+VERSION = "1.54"
 HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
@@ -100,6 +101,10 @@ def parse_args():
     p.add_argument("--summary-interval", type=int, default=30)
     p.add_argument("--export-stats", action="store_true", default=False)
     p.add_argument("--aurora-feed", action="store_true", default=False)
+    p.add_argument("--hmc-step", type=float, default=None,
+                   help="Override HMC step size (default: auto by fermion mode)")
+    p.add_argument("--hmc-leapfrog", type=int, default=None,
+                   help="Override number of leapfrog steps")
     return p.parse_args()
 
 
@@ -137,7 +142,6 @@ def cleanup_distributed():
 
 
 def cg_solve(matvec: Callable, b: torch.Tensor, x0=None, tol=1e-8, maxiter=200):
-    """Hermitian CG: Q x = b. Returns (x, iters, residual)."""
     x = torch.zeros_like(b) if x0 is None else x0.clone()
     r = b - matvec(x)
     p = r.clone()
@@ -171,8 +175,11 @@ class DistributedLattice:
                 f"Choose L that divides evenly (e.g. L=4 with world_size=1 or 2)."
             )
         self.local_L = self.L // world_size
-        self.halo = 1
-        self.local_padded_shape = (self.local_L + 2 * self.halo, self.L, self.L, self.L)
+        # Critical: no halo padding for single-rank (true L^4 with roll BC)
+        self.halo = 0 if world_size == 1 else 1
+        self.local_padded_shape = (
+            self.local_L + 2 * self.halo, self.L, self.L, self.L
+        )
         self.local_volume = self.local_L * (self.L ** 3)
         self.global_volume = self.L ** 4
         self.left_neighbor = (rank - 1) % world_size
@@ -180,8 +187,14 @@ class DistributedLattice:
         self.device = torch.device(config.device)
         self.dtype = config.dtype
 
+    def interior_slice(self):
+        """Slice that selects physical (non-halo) sites along axis 0."""
+        if self.halo == 0:
+            return slice(None)
+        return slice(self.halo, self.halo + self.local_L)
+
     def _halo_exchange(self, tensor, tag_base=42):
-        if self.world_size == 1:
+        if self.world_size == 1 or self.halo == 0:
             return
         left, right = self.left_neighbor, self.right_neighbor
         recv_l = dist.irecv(tensor.narrow(0, 0, 1).contiguous(), src=left, tag=tag_base)
@@ -194,7 +207,7 @@ class DistributedLattice:
         self._halo_exchange(U, 100)
 
     def shift(self, field, axis, direction):
-        if axis != 0 or self.world_size == 1:
+        if axis != 0 or self.world_size == 1 or self.halo == 0:
             return torch.roll(field, shifts=-direction, dims=axis)
         self._halo_exchange(field, 300 + axis)
         return torch.roll(field, shifts=-direction, dims=0)
@@ -205,6 +218,12 @@ class DistributedLattice:
         s = x.clone()
         dist.all_reduce(s, op=dist.ReduceOp.SUM)
         return s
+
+    def sum_interior(self, field):
+        """Sum a scalar field over physical sites only, then all-reduce."""
+        sl = self.interior_slice()
+        local = field[sl].sum() if field.dim() >= 1 else field
+        return self.global_sum(local)
 
 
 class DistributedGaugeField:
@@ -218,10 +237,11 @@ class DistributedGaugeField:
         self.U = expm_anti_hermitian(project_traceless_antihermitian(X)) @ eye
 
     def plaquette_traces(self, U=None):
+        """Per-site sum of ReTr(U_p)/N over the 6 planes. Includes halo sites."""
         if U is None:
             U = self.U
         lat = self.lattice
-        traces = []
+        acc = None
         for mu in range(4):
             for nu in range(mu + 1, 4):
                 U_mu = U[..., mu, :, :]
@@ -229,13 +249,18 @@ class DistributedGaugeField:
                 U_mu_xpn = lat.shift(U_mu, nu, +1)
                 plaq = U_mu @ U_nu_xpm @ dagger(U_mu_xpn) @ dagger(U[..., nu, :, :])
                 tr = torch.diagonal(plaq, -2, -1).sum(-1).real / self.config.color_dim
-                traces.append(tr)
-        return lat.global_sum(torch.stack(traces).sum()) / lat.global_volume
+                acc = tr if acc is None else acc + tr
+        return acc  # shape: lattice sites
 
     def wilson_action(self, U=None):
+        """S_G = β Σ_p (1 - ReTr/N) over physical sites only."""
         if U is None:
             U = self.U
-        return self.config.beta * self.lattice.global_volume * (1.0 - self.plaquette_traces(U))
+        traces = self.plaquette_traces(U)  # sum over 6 planes per site
+        # 6 planes → S = β * sum_sites sum_planes (1 - tr) = β * sum_sites (6 - traces)
+        per_site = 6.0 - traces
+        total = self.lattice.sum_interior(per_site)
+        return self.config.beta * total
 
     def force(self, U=None):
         if U is None:
@@ -279,13 +304,10 @@ class DistributedWilsonDiracOperator:
         )
 
     def normal_op(self, psi, U):
-        """Q = D† D — Hermitian positive-definite operator for CG."""
         return self.apply_dagger(self.apply(psi, U), U)
 
 
 class DistributedPseudofermionField:
-    """Full dynamical-fermion pseudofermion field with heatbath, action, force."""
-
     def __init__(self, lattice, dirac, config, generator):
         self.lattice = lattice
         self.dirac = dirac
@@ -312,13 +334,12 @@ class DistributedPseudofermionField:
         return x, iters, resid
 
     def action(self, x, U):
-        """S_pf = ||D x||² given x = Q⁻¹ φ."""
         Dx = self.dirac.apply(x, U)
-        local = torch.sum((Dx.conj() * Dx).real)
-        return self.lattice.global_sum(local)
+        # Sum |Dx|^2 over physical sites only
+        dens = (Dx.conj() * Dx).real.sum(dim=(-1, -2))  # per site
+        return self.lattice.sum_interior(dens)
 
     def force(self, x, U):
-        """su(N) force from S_pf with x held fixed (adjoint-state identity)."""
         U_req = U.detach().clone().requires_grad_(True)
         S = self.action(x.detach(), U_req)
         grad = torch.autograd.grad(S, U_req)[0]
@@ -346,6 +367,13 @@ class DistributedHMC:
         if len(lst) > maxlen:
             del lst[: len(lst) - maxlen]
 
+    def _kinetic(self, P):
+        """(1/2) Tr(P²) summed over physical sites only."""
+        # P shape: lattice + (4, N, N)
+        dens = 0.5 * (P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real  # per site, per dir
+        dens = dens.sum(dim=-1)  # sum over 4 directions → per site
+        return self.lattice.sum_interior(dens)
+
     def _force_at(self, U, pf_x0=None):
         F = self.gauge.force(U)
         pf_x = None
@@ -357,8 +385,7 @@ class DistributedHMC:
         return F, pf_x
 
     def _hamiltonian(self, U, P, pf_x0=None):
-        kinetic = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
-        kinetic = self.lattice.global_sum(kinetic)
+        kinetic = self._kinetic(P)
         potential = self.gauge.wilson_action(U)
         pf_x = None
         if self.pseudo is not None:
@@ -385,6 +412,11 @@ class DistributedHMC:
         eps = cfg.hmc_step_size
 
         F, pf_x = self._force_at(U, pf_x0=pf_x)
+        if self.diagnostic and lat.rank == 0 and self.n_total == 0:
+            # One-shot force scale report for tuning
+            f_norm = float(torch.sqrt(torch.sum((F.conj() * F).real)).item())
+            print(f"  [Diag] |F| ≈ {f_norm:.4e}  (step={eps}, leapfrog={cfg.hmc_n_leapfrog})")
+
         P = P + 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
@@ -404,7 +436,7 @@ class DistributedHMC:
 
         if not math.isfinite(delta_h):
             if self.diagnostic and lat.rank == 0:
-                print(f"  [Diag] Non-finite delta_H; forcing reject")
+                print("  [Diag] Non-finite delta_H; forcing reject")
             accepted = False
         else:
             accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
@@ -481,9 +513,13 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
-    # Slightly tighter / fewer leapfrog steps when fermions are on (CG cost)
-    leapfrog = 10 if args.include_fermions else 20
-    step_size = 0.01 if args.include_fermions else 0.012
+    # Tuned defaults: fermion force is much stiffer than pure gauge
+    if args.include_fermions:
+        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
+        step_size = args.hmc_step if args.hmc_step is not None else 0.002
+    else:
+        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
+        step_size = args.hmc_step if args.hmc_step is not None else 0.012
 
     config = ConfigV2(
         L=4, beta=5.5, hmc_n_leapfrog=leapfrog, hmc_step_size=step_size,
@@ -526,10 +562,10 @@ def main():
         mode = "DYNAMICAL (gauge + pseudofermion force)" if config.include_fermions else "QUENCHED"
         run_mode = "CONTINUOUS" if args.continuous else f"{hmc_trajectories} traj"
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...")
+        print(f"  lattice={config.L}^4  leapfrog={leapfrog}  step={step_size}  τ={leapfrog * step_size:.4f}")
         if config.include_fermions:
-            print(f"  leapfrog={leapfrog} step={step_size} (CG per force eval)\n")
-        else:
-            print()
+            print("  (CG solve per force evaluation)")
+        print()
 
     interrupted = False
     summary_interval = max(1, args.summary_interval)
