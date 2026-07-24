@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.55
+meta_field_distributed.py v1.56
 
-Fermion HMC retuned: smaller step, tighter MD CG, ΔK/ΔS diagnostics.
+Force-sign fix: momentum update is P += -ε(iF) so that dK ≈ -dS.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.55"
+VERSION = "1.56"
 HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
@@ -250,6 +250,10 @@ class DistributedGaugeField:
         return self.config.beta * total
 
     def force(self, U=None):
+        """Algebra-valued force F such that dP/dt = -iF keeps H conserved.
+
+        F is traceless anti-Hermitian.  The leapfrog step uses P += -ε(iF).
+        """
         if U is None:
             U = self.U
         U_req = U.detach().clone().requires_grad_(True)
@@ -360,7 +364,6 @@ class DistributedHMC:
         F = self.gauge.force(U)
         pf_x = None
         if self.pseudo is not None:
-            # Tight MD tolerance — force/action consistency matters for ΔH
             tol = getattr(self.config, "cg_tol_md", 1e-8)
             pf_x, iters, resid = self.pseudo.solve(U, tol=tol, x0=pf_x0)
             self.last_cg_stats = {"md_cg_iters": iters, "md_cg_resid": resid}
@@ -400,14 +403,15 @@ class DistributedHMC:
             f_norm = float(torch.sqrt(torch.sum((F.conj() * F).real)).item())
             print(f"  [Diag] |F|≈{f_norm:.4e}  step={eps}  leapfrog={cfg.hmc_n_leapfrog}  τ={eps * cfg.hmc_n_leapfrog:.4f}")
 
-        P = P + 0.5 * eps * (1j * F)
+        # CRITICAL: minus sign so dP/dt = -∂S  →  dK ≈ -dS
+        P = P - 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
             U = expm_anti_hermitian(eps * (-1j * P)) @ U
             lat.update_halo_gauge(U)
             F, pf_x = self._force_at(U, pf_x0=pf_x)
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
-            P = P + coeff * (1j * F)
+            P = P - coeff * (1j * F)
 
         K1 = self._kinetic(P)
         S1, pf_x_final = self._potential(U, pf_x0=pf_x)
@@ -503,7 +507,6 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
-    # Fermion force is stiff; keep τ short and CG tight
     if args.include_fermions:
         leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 40
         step_size = args.hmc_step if args.hmc_step is not None else 0.0005
