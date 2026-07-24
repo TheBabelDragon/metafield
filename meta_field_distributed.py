@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.42
+meta_field_distributed.py v1.43
 
-Force-based Attractor Dynamics + Homeostasis + Adaptive Basins.
+Scaled memory/attractor capacities. Exploration base remains 0.15.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.42 (Adaptive Basins)")
+    print("  MetaField Distributed v1.43 (Scaled Capacities)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -417,7 +417,7 @@ def main():
                 memory.add(exp)
 
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
-                    batch = memory.sample(16)
+                    batch = memory.sample(24)
 
                     for e in batch:
                         if e.interestingness > 0.8:
@@ -425,7 +425,7 @@ def main():
 
                     attractor_dyn.step()
 
-                    recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
+                    recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
 
@@ -452,10 +452,10 @@ def main():
                     recent_pred_loss = None
 
                     if predictor is not None and len(memory.buffer) > 8:
-                        recent = hmc.field_samples[-min(8, len(hmc.field_samples)):]
+                        recent = hmc.field_samples[-min(12, len(hmc.field_samples)):]
                         x_batch = torch.stack(recent).to(torch.float64)
                         z_batch = geometry.encode(x_batch)
-                        actions = torch.tensor([e.action for e in memory.sample(8)], dtype=torch.float64)
+                        actions = torch.tensor([e.action for e in memory.sample(12)], dtype=torch.float64)
                         target_mean = actions.mean()
                         target_std = actions.std() + 1e-6
                         target = ((actions - target_mean) / target_std).unsqueeze(1)
@@ -466,15 +466,17 @@ def main():
                     health = "Good"
                     if recent_pred_loss is not None and recent_pred_loss > 0.1:
                         health = "Warning (high pred loss)"
-                    elif mem_stats.get('size', 0) < 20:
+                    elif mem_stats.get('size', 0) < 30:
                         health = "Building memory..."
 
                     energy = att_stats.get('total_energy', 0)
-                    budget = att_stats.get('energy_budget', 40)
+                    budget = att_stats.get('energy_budget', 60)
+                    mem_size = mem_stats.get('size', 0)
+                    mem_max = mem_stats.get('max_size', 512)
 
                     print(
                         f"[Summary @ {t}] Health: {health} | "
-                        f"Mem: {mem_stats.get('size', 0)} | "
+                        f"Mem: {mem_size}/{mem_max} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
                         f"(E={energy:.1f}/{budget:.0f}, "
