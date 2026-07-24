@@ -4,14 +4,7 @@ attractors.py
 
 Force-based Attractor Dynamics with Homeostasis and Adaptive Basins.
 
-Attractors interact via continuous forces. Merge is emergent.
-Homeostasis keeps total energy near a budget.
-Basin radius and variance adapt to replay consistency:
-  - Coherent replay → basin expands (stable concept)
-  - Noisy / inconsistent observations → basin stays tight or contracts
-
-Layer separation:
-  Field → Attractor Dynamics → Geometry Training
+Scaled capacities for longer continuous runs.
 """
 
 from __future__ import annotations
@@ -23,13 +16,6 @@ import torch
 
 
 class Attractor:
-    """
-    A single attractor in latent space with adaptive basin.
-
-    State:
-      position, strength, radius, age, replay_count, variance
-    """
-
     def __init__(self, position: torch.Tensor, strength: float = 1.0,
                  radius: float = 0.5):
         self.position = position.detach().cpu().clone().to(torch.float64)
@@ -38,12 +24,10 @@ class Attractor:
         self.age = 0
         self.replay_count = 1
         self.variance = 0.25
-        # Running estimate of how consistent recent observations are
         self.consistency = 1.0
 
     def reinforce(self, amount: float = 1.0,
                   new_position: Optional[torch.Tensor] = None):
-        """Strengthen and adapt basin based on observation consistency."""
         self.strength += amount
         self.replay_count += 1
         self.age = 0
@@ -53,22 +37,15 @@ class Attractor:
             delta = new_pos - self.position
             dist = torch.norm(delta).item()
 
-            # Update local variance (exponential moving average)
             self.variance = 0.9 * self.variance + 0.1 * (dist ** 2)
 
-            # Consistency: how close the new observation is relative to current radius
             relative = dist / (self.radius + 1e-6)
-            # High consistency when observation lands well inside the basin
             obs_consistency = math.exp(-relative * 1.5)
             self.consistency = 0.85 * self.consistency + 0.15 * obs_consistency
 
-            # Soft move toward the observation
             alpha = min(0.3, amount / (self.strength + 1e-6))
             self.position = (1 - alpha) * self.position + alpha * new_pos
 
-            # Adaptive radius:
-            # - Consistent replay → slowly expand (stable concept)
-            # - Inconsistent → contract or stay tight
             if self.consistency > 0.7:
                 self.radius = min(2.5, self.radius + 0.03 * self.consistency)
             elif self.consistency < 0.35:
@@ -77,7 +54,6 @@ class Attractor:
     def decay(self, factor: float = 0.997):
         self.strength *= factor
         self.age += 1
-        # Very old, rarely reinforced basins slowly shrink
         if self.age > 50:
             self.radius = max(0.2, self.radius * 0.999)
 
@@ -86,13 +62,9 @@ class Attractor:
 
 
 class AttractorDynamics:
-    """
-    Force-based attractor landscape with homeostasis and adaptive basins.
-    """
-
     def __init__(self,
-                 max_attractors: int = 48,
-                 energy_budget: float = 40.0,
+                 max_attractors: int = 64,
+                 energy_budget: float = 60.0,
                  merge_tolerance: float = 0.15,
                  attraction_scale: float = 0.8,
                  repulsion_scale: float = 0.4,
@@ -125,7 +97,6 @@ class AttractorDynamics:
         nearest = self.attractors[nearest_idx]
         dist = distances[nearest_idx]
 
-        # Use adaptive radius for membership decision
         if dist < nearest.radius * 1.8:
             nearest.reinforce(amount=0.4 + 0.3 * interestingness, new_position=latent)
         else:

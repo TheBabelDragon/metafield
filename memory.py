@@ -56,7 +56,7 @@ class EpisodicExperience:
 class EpisodicMemory:
     """Prioritized episodic buffer. Feeds high-interest experiences into AttractorDynamics."""
 
-    def __init__(self, max_size: int = 256,
+    def __init__(self, max_size: int = 512,
                  base_exploration_rate: float = 0.15,
                  min_exploration: float = 0.05,
                  max_exploration: float = 0.35):
@@ -79,7 +79,7 @@ class EpisodicMemory:
         rate = self.base_exploration_rate * (1.5 / (1.0 + avg_interest))
         return max(self.min_exploration, min(self.max_exploration, rate))
 
-    def sample(self, n: int = 16) -> List[EpisodicExperience]:
+    def sample(self, n: int = 24) -> List[EpisodicExperience]:
         if len(self.buffer) == 0:
             return []
         if len(self.buffer) <= n:
@@ -107,6 +107,7 @@ class EpisodicMemory:
         if not self.buffer:
             return {
                 "size": 0,
+                "max_size": self.max_size,
                 "avg_priority": 0.0,
                 "avg_interestingness": 0.0,
                 "exploration_rate": self.base_exploration_rate,
@@ -115,6 +116,7 @@ class EpisodicMemory:
         interestingnesses = [e.interestingness for e in self.buffer]
         return {
             "size": len(self.buffer),
+            "max_size": self.max_size,
             "avg_priority": sum(priorities) / len(priorities),
             "avg_interestingness": sum(interestingnesses) / len(interestingnesses),
             "exploration_rate": self._current_exploration_rate(),
