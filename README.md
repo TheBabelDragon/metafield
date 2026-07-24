@@ -15,6 +15,7 @@ MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge th
 - Latent predictor that forms expectations about future behavior
 - Dynamic geometry training (epochs scale with data volume)
 - Efficient continuous mode (`--continuous`) with configurable system summaries
+- Aurora environment feed (read-only drive force from swarm sensing)
 
 ---
 
@@ -29,6 +30,7 @@ Aurora provides the distributed swarm infrastructure (node coordination, schedul
 - Created `aurora_mods/metafield_sensing/` — a proposed first mod that exposes MetaField memory, prediction, and geometry signals into Aurora’s sensing layer.
 - MetaField core components (`memory.py`, `prediction.py`, `geometry.py`) have been extracted and cleaned up for easier integration.
 - Strong emphasis on observability (`get_stats()`, periodic summaries) to support future Aurora sensing.
+- Read-only Aurora environment feed that modulates exploration and energy budgets.
 
 See `aurora_mods/metafield_sensing/` for the current proposal and `INTEGRATION_PLAN.md` + `HYBRID_VISION.md` for the broader roadmap.
 
@@ -42,13 +44,17 @@ cd metafield
 
 python -m venv ../.venv
 source ../.venv/bin/activate
-pip install torch matplotlib scikit-learn
+pip install -r requirements.txt
 
-# Recommended
+# Recommended continuous run (single process)
 python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
 ```
 
 Press `Ctrl+C` to stop cleanly.
+
+Optional flags:
+- `--export-stats` — write local stats.json for the sensing mod
+- `--aurora-feed` — enable read-only drive force from Aurora (requires Redis)
 
 ---
 
@@ -58,6 +64,7 @@ Press `Ctrl+C` to stop cleanly.
 - Periodic high-level health + memory + prediction summaries in continuous mode
 - Major modularization (memory, prediction, and geometry extracted to their own files)
 - Aurora integration work started (`metafield_sensing` mod proposal)
+- Soft attractor influence on the learned geometry manifold
 
 ---
 
@@ -69,16 +76,18 @@ Press `Ctrl+C` to stop cleanly.
 | `EpisodicMemory`            | Prioritized episodic memory with `get_stats()`        |
 | `LatentPredictor`           | Predicts future values from latent representations    |
 | `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on fields           |
+| `AttractorDynamics`         | Persistent basins that deform the latent manifold     |
+| `AuroraFeed`                | Read-only environment drive force from the swarm      |
 
 ---
 
 ## Continuous Mode (Recommended)
 
 ```bash
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30 --export-stats
 ```
 
-Long-running sessions are well supported and now include periodic system summaries.
+Long-running sessions are well supported and now include periodic system summaries and optional local stats export for Aurora sensing.
 
 ---
 
@@ -92,7 +101,8 @@ Multi-machine support exists but is still sensitive to system configuration (com
 
 - Python 3.10+
 - PyTorch 2.0+
-- matplotlib + scikit-learn
+- matplotlib (optional, for plots)
+- scikit-learn (optional, for PCA visualization of latents)
 
 ## License
 

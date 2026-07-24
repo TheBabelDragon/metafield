@@ -1,1 +1,5 @@
 torch>=2.0.0
+
+# Optional but recommended
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
