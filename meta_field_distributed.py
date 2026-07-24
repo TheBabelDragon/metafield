@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.43
+meta_field_distributed.py v1.44
 
-Scaled memory/attractor capacities. Exploration base remains 0.15.
+Soft expandable memory capacity for long continuous runs.
+No rigid hard caps on episodic buffer or attractor count.
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.43 (Scaled Capacities)")
+    print("  MetaField Distributed v1.44 (Soft Expandable Capacity)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -470,13 +471,13 @@ def main():
                         health = "Building memory..."
 
                     energy = att_stats.get('total_energy', 0)
-                    budget = att_stats.get('energy_budget', 60)
+                    budget = att_stats.get('energy_budget', 80)
                     mem_size = mem_stats.get('size', 0)
-                    mem_max = mem_stats.get('max_size', 512)
+                    soft_cap = mem_stats.get('soft_capacity', 512)
 
                     print(
                         f"[Summary @ {t}] Health: {health} | "
-                        f"Mem: {mem_size}/{mem_max} | "
+                        f"Mem: {mem_size}/{soft_cap} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
                         f"(E={energy:.1f}/{budget:.0f}, "
