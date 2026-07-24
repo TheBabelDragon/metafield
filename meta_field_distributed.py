@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.52
+meta_field_distributed.py v1.53
 
-Hardened continuous path:
-- Bounded histories (no unbounded growth)
-- Aligned predictor / geometry batch sizes
-- Non-finite delta_H guarded
-- Intelligence loop failures cannot kill the run
-- Clearer distributed lattice errors
+Hardened continuous path + full dynamical fermions (CG + pf force).
+Bounded histories, aligned predictor batches, non-finite guards,
+self-healing lock, attractor→geometry deformation loop.
 """
 
 from __future__ import annotations
@@ -17,16 +14,10 @@ import sys
 import math
 import socket
 import argparse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, Tuple
 
 import torch
 import torch.distributed as dist
-
-try:
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
 
 from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
@@ -46,8 +37,8 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.52"
-HISTORY_MAX = 512  # bound HMC diagnostic histories in continuous mode
+VERSION = "1.53"
+HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
 
@@ -74,7 +65,7 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank, world_size, role, diagnostic=False):
     print("\n" + "=" * 72)
-    print(f"  MetaField Distributed v{VERSION} (Aurora Environment Feed)")
+    print(f"  MetaField Distributed v{VERSION}")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
@@ -106,11 +97,9 @@ def parse_args():
     p.add_argument("--diagnostic", action="store_true", default=False)
     p.add_argument("--save-plots", action="store_true", default=False)
     p.add_argument("--continuous", action="store_true", default=False)
-    p.add_argument("--summary-interval", type=int, default=30,
-                   help="How often (in trajectories) to print system summary & export stats")
+    p.add_argument("--summary-interval", type=int, default=30)
     p.add_argument("--export-stats", action="store_true", default=False)
-    p.add_argument("--aurora-feed", action="store_true", default=False,
-                   help="Read Aurora sensing as start prompt + live drive force (read-only)")
+    p.add_argument("--aurora-feed", action="store_true", default=False)
     return p.parse_args()
 
 
@@ -125,7 +114,6 @@ def init_distributed(args):
         rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
 
     master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
-    master_port = args.master_port
 
     if world_size > 1:
         if master_addr.startswith("127."):
@@ -140,12 +128,35 @@ def init_distributed(args):
             sys.exit(1)
 
     print_banner(rank, world_size, role, args.diagnostic)
-    return rank, world_size, master_addr, master_port
+    return rank, world_size, master_addr, args.master_port
 
 
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def cg_solve(matvec: Callable, b: torch.Tensor, x0=None, tol=1e-8, maxiter=200):
+    """Hermitian CG: Q x = b. Returns (x, iters, residual)."""
+    x = torch.zeros_like(b) if x0 is None else x0.clone()
+    r = b - matvec(x)
+    p = r.clone()
+    rs_old = torch.sum(r.conj() * r).real
+    b_norm = torch.sqrt(torch.sum(b.conj() * b).real).clamp_min(1e-30)
+
+    for it in range(maxiter):
+        Ap = matvec(p)
+        denom = torch.sum(p.conj() * Ap).real.clamp_min(1e-30)
+        alpha = rs_old / denom
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rs_new = torch.sum(r.conj() * r).real
+        resid = torch.sqrt(rs_new) / b_norm
+        if resid < tol:
+            return x, it + 1, float(resid)
+        p = r + (rs_new / rs_old.clamp_min(1e-30)) * p
+        rs_old = rs_new
+    return x, maxiter, float(torch.sqrt(rs_old) / b_norm)
 
 
 class DistributedLattice:
@@ -254,22 +265,34 @@ class DistributedWilsonDiracOperator:
             psi_fwd = lat.shift(psi, mu, +1)
             psi_back = lat.shift(psi, mu, -1)
             out = out - 0.5 * (
-                torch.einsum("st,...ti->...si", self.r_minus[mu], torch.einsum("...ij,...sj->...si", U_mu, psi_fwd))
-                + torch.einsum("st,...ti->...si", self.r_plus[mu], torch.einsum("...ij,...sj->...si", dagger(U_mu_back), psi_back))
+                torch.einsum("st,...ti->...si", self.r_minus[mu],
+                             torch.einsum("...ij,...sj->...si", U_mu, psi_fwd))
+                + torch.einsum("st,...ti->...si", self.r_plus[mu],
+                               torch.einsum("...ij,...sj->...si", dagger(U_mu_back), psi_back))
             )
         return out
 
     def apply_dagger(self, psi, U):
-        return torch.einsum("st,...ti->...si", self.g5, self.apply(torch.einsum("st,...ti->...si", self.g5, psi), U))
+        return torch.einsum(
+            "st,...ti->...si", self.g5,
+            self.apply(torch.einsum("st,...ti->...si", self.g5, psi), U),
+        )
+
+    def normal_op(self, psi, U):
+        """Q = D† D — Hermitian positive-definite operator for CG."""
+        return self.apply_dagger(self.apply(psi, U), U)
 
 
 class DistributedPseudofermionField:
+    """Full dynamical-fermion pseudofermion field with heatbath, action, force."""
+
     def __init__(self, lattice, dirac, config, generator):
         self.lattice = lattice
         self.dirac = dirac
         self.config = config
         self.generator = generator
         self.phi = None
+        self.last_cg = {}
 
     def refresh(self, U):
         shape = self.lattice.local_padded_shape + (self.config.spinor_dim, self.config.color_dim)
@@ -277,6 +300,29 @@ class DistributedPseudofermionField:
         imag = torch.randn(shape, generator=self.generator, dtype=torch.float64, device=self.lattice.device)
         eta = (real + 1j * imag).to(self.config.dtype)
         self.phi = self.dirac.apply_dagger(eta, U)
+
+    def solve(self, U, tol, x0=None):
+        def matvec(v):
+            return self.dirac.normal_op(v, U)
+        x, iters, resid = cg_solve(
+            matvec, self.phi, x0=x0, tol=tol,
+            maxiter=getattr(self.config, "cg_maxiter", 200),
+        )
+        self.last_cg = {"iters": iters, "resid": resid}
+        return x, iters, resid
+
+    def action(self, x, U):
+        """S_pf = ||D x||² given x = Q⁻¹ φ."""
+        Dx = self.dirac.apply(x, U)
+        local = torch.sum((Dx.conj() * Dx).real)
+        return self.lattice.global_sum(local)
+
+    def force(self, x, U):
+        """su(N) force from S_pf with x held fixed (adjoint-state identity)."""
+        U_req = U.detach().clone().requires_grad_(True)
+        S = self.action(x.detach(), U_req)
+        grad = torch.autograd.grad(S, U_req)[0]
+        return project_traceless_antihermitian(U_req.detach() @ dagger(grad.detach()))
 
 
 class DistributedHMC:
@@ -293,51 +339,72 @@ class DistributedHMC:
         self.delta_h_history: List[float] = []
         self.accepted_history: List[bool] = []
         self.field_samples: List[torch.Tensor] = []
+        self.last_cg_stats: Dict[str, Any] = {}
 
-    def _append_bounded(self, lst: list, value, maxlen: int = HISTORY_MAX):
+    def _append_bounded(self, lst, value, maxlen=HISTORY_MAX):
         lst.append(value)
         if len(lst) > maxlen:
             del lst[: len(lst) - maxlen]
+
+    def _force_at(self, U, pf_x0=None):
+        F = self.gauge.force(U)
+        pf_x = None
+        if self.pseudo is not None:
+            tol = getattr(self.config, "cg_tol_md", 1e-6)
+            pf_x, iters, resid = self.pseudo.solve(U, tol=tol, x0=pf_x0)
+            self.last_cg_stats = {"md_cg_iters": iters, "md_cg_resid": resid}
+            F = F + self.pseudo.force(pf_x, U)
+        return F, pf_x
+
+    def _hamiltonian(self, U, P, pf_x0=None):
+        kinetic = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
+        kinetic = self.lattice.global_sum(kinetic)
+        potential = self.gauge.wilson_action(U)
+        pf_x = None
+        if self.pseudo is not None:
+            tol = getattr(self.config, "cg_tol_action", 1e-10)
+            pf_x, iters, resid = self.pseudo.solve(U, tol=tol, x0=pf_x0)
+            self.last_cg_stats = {"action_cg_iters": iters, "action_cg_resid": resid}
+            potential = potential + self.pseudo.action(pf_x, U)
+        return kinetic + potential, pf_x
 
     def trajectory(self):
         cfg, lat = self.config, self.lattice
         U0 = self.gauge.U.clone()
         P0 = random_su_n_hermitian(U0.shape, cfg.color_dim, cfg.dtype, U0.device, self.generator)
-        if self.pseudo:
+
+        if self.pseudo is not None:
             self.pseudo.refresh(U0)
 
-        action0 = float(self.gauge.wilson_action(U0).real)
-        kinetic0 = 0.5 * torch.sum((P0 @ P0).diagonal(dim1=-2, dim2=-1).sum(-1).real)
-        H0 = lat.global_sum(kinetic0) + action0
+        H0, pf_x = self._hamiltonian(U0, P0)
 
-        if self.diagnostic and self.lattice.rank == 0:
-            print(f"  [Diag] Start Action = {action0:.4f}")
+        if self.diagnostic and lat.rank == 0:
+            print(f"  [Diag] Start H = {float(H0.real):.4f}")
 
         U, P = U0.clone(), P0.clone()
         eps = cfg.hmc_step_size
-        F = self.gauge.force(U)
-        P += 0.5 * eps * (1j * F)
+
+        F, pf_x = self._force_at(U, pf_x0=pf_x)
+        P = P + 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
             U = expm_anti_hermitian(eps * (-1j * P)) @ U
             lat.update_halo_gauge(U)
-            F = self.gauge.force(U)
+            F, pf_x = self._force_at(U, pf_x0=pf_x)
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
-            P += coeff * (1j * F)
+            P = P + coeff * (1j * F)
 
-        action1 = float(self.gauge.wilson_action(U).real)
-        kinetic1 = 0.5 * torch.sum((P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real)
-        H1 = lat.global_sum(kinetic1) + action1
+        H1, pf_x_final = self._hamiltonian(U, P, pf_x0=pf_x)
         delta_h = float((H1 - H0).real)
 
-        if self.diagnostic and self.lattice.rank == 0:
-            print(f"  [Diag] End Action   = {action1:.4f} | raw dH = {delta_h:+.4f}")
+        if self.diagnostic and lat.rank == 0:
+            print(f"  [Diag] End H   = {float(H1.real):.4f} | dH = {delta_h:+.4f}")
+            if self.last_cg_stats:
+                print(f"  [Diag] CG    = {self.last_cg_stats}")
 
-        # Guard non-finite delta_H (can appear if force/expm goes sideways)
         if not math.isfinite(delta_h):
-            if self.diagnostic and self.lattice.rank == 0:
-                print(f"  [Diag] Non-finite delta_H={delta_h}; forcing reject")
-            accept_prob = 0.0
+            if self.diagnostic and lat.rank == 0:
+                print(f"  [Diag] Non-finite delta_H; forcing reject")
             accepted = False
         else:
             accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
@@ -348,21 +415,24 @@ class DistributedHMC:
             self.n_accepted += 1
             self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
-            if self.diagnostic and self.lattice.rank == 0:
+            if self.diagnostic and lat.rank == 0:
                 sample = self.gauge.U.detach().flatten().real[:8192].to(torch.float64)
                 self._append_bounded(self.field_samples, sample, FIELD_SAMPLE_MAX)
 
-        self._append_bounded(self.action_history, action1)
+        action_val = float(self.gauge.wilson_action().real)
+        self._append_bounded(self.action_history, action_val)
         self._append_bounded(self.delta_h_history, delta_h)
         self._append_bounded(self.accepted_history, accepted)
+
         return {
             "delta_h": delta_h if math.isfinite(delta_h) else float("nan"),
             "accepted": accepted,
             "acceptance_rate": self.n_accepted / max(1, self.n_total),
+            **self.last_cg_stats,
         }
 
 
-def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
+def apply_drive(feed, memory, attractor_dyn):
     if feed is None:
         return None
     snap = feed.poll()
@@ -411,8 +481,12 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
+    # Slightly tighter / fewer leapfrog steps when fermions are on (CG cost)
+    leapfrog = 10 if args.include_fermions else 20
+    step_size = 0.01 if args.include_fermions else 0.012
+
     config = ConfigV2(
-        L=4, beta=5.5, hmc_n_leapfrog=20, hmc_step_size=0.012,
+        L=4, beta=5.5, hmc_n_leapfrog=leapfrog, hmc_step_size=step_size,
         hmc_trajectories=hmc_trajectories,
         include_fermions=args.include_fermions,
         seed=42 + rank, device="cpu", dtype=torch.complex128,
@@ -436,12 +510,11 @@ def main():
 
     memory = EpisodicMemory() if (args.diagnostic and rank == 0) else None
     attractor_dyn = AttractorDynamics() if (args.diagnostic and rank == 0) else None
-    # Predictor latent dim will be aligned when geometry is created
     predictor = None
     predictor_optimizer = None
-    geometry: Optional[LearnedInformationGeometry] = None
-    last_geometry_loss: Optional[float] = None
-    last_curvature: Optional[float] = None
+    geometry = None
+    last_geometry_loss = None
+    last_curvature = None
     last_geom_diag: Dict[str, float] = {}
     intel_failures = 0
 
@@ -450,12 +523,13 @@ def main():
         interest_gate = max(0.5, min(1.2, 0.8 + drive.interest_bias))
 
     if rank == 0:
-        mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED"
+        mode = "DYNAMICAL (gauge + pseudofermion force)" if config.include_fermions else "QUENCHED"
         run_mode = "CONTINUOUS" if args.continuous else f"{hmc_trajectories} traj"
-        print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
+        print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...")
         if config.include_fermions:
-            print("[Note] Distributed path currently uses gauge force only; "
-                  "pseudofermion field is refreshed but not yet in the MD force.")
+            print(f"  leapfrog={leapfrog} step={step_size} (CG per force eval)\n")
+        else:
+            print()
 
     interrupted = False
     summary_interval = max(1, args.summary_interval)
@@ -476,8 +550,7 @@ def main():
                 if geometry is None:
                     geometry = LearnedInformationGeometry(
                         input_dim=int(hmc.field_samples[0].shape[0]),
-                        latent_dim=8,
-                        attractor_weight=0.4,
+                        latent_dim=8, attractor_weight=0.4,
                     )
                     predictor = LatentPredictor(latent_dim=8).to(torch.float64)
                     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4)
@@ -508,23 +581,17 @@ def main():
                 exp.update_priority(reconstruction_error=recon_error)
                 memory.add(exp)
 
-                # --- Core intelligence loop (every 25 trajectories) ---
                 if len(memory.buffer) > 8 and t % 25 == 0:
                     try:
                         batch = memory.sample(24)
-
                         if attractor_dyn is not None:
                             for e in batch:
                                 if e.interestingness > interest_gate:
-                                    attractor_dyn.reinforce_from_latent(
-                                        e.latent, interestingness=e.interestingness
-                                    )
+                                    attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
                             attractor_dyn.step()
 
-                        # Train predictor on *aligned* batches from the same experiences
                         if predictor is not None and predictor_optimizer is not None and batch:
-                            z_list = []
-                            action_list = []
+                            z_list, action_list = [], []
                             for e in batch:
                                 if e.latent is not None and e.latent.numel() == predictor.latent_dim:
                                     z_list.append(e.latent.to(torch.float64).reshape(-1))
@@ -532,9 +599,8 @@ def main():
                             if len(z_list) >= 4:
                                 z_batch = torch.stack(z_list)
                                 actions = torch.tensor(action_list, dtype=torch.float64)
-                                target_mean = actions.mean()
-                                target_std = actions.std() + 1e-6
-                                target = ((actions - target_mean) / target_std).unsqueeze(1)
+                                tm, ts = actions.mean(), actions.std() + 1e-6
+                                target = ((actions - tm) / ts).unsqueeze(1)
                                 pred = predictor(z_batch)
                                 pred_loss = torch.mean((pred - target) ** 2)
                                 if math.isfinite(float(pred_loss.item())):
@@ -544,19 +610,13 @@ def main():
                                     predictor_optimizer.step()
                                     pl = float(pred_loss.item())
                                     for e in batch:
-                                        e.update_priority(
-                                            prediction_error=pl,
-                                            reconstruction_error=recon_error,
-                                        )
+                                        e.update_priority(prediction_error=pl, reconstruction_error=recon_error)
 
-                        # Train geometry (attractor-guided)
                         recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                         landscape = attractor_dyn.get_landscape() if attractor_dyn is not None else []
                         if len(recent) >= 4:
                             last_geometry_loss = geometry.train_on_batch(
-                                recent,
-                                epochs=12,
-                                attractors=landscape if landscape else None,
+                                recent, epochs=12, attractors=landscape if landscape else None,
                             )
 
                         try:
@@ -579,24 +639,17 @@ def main():
                     if predictor is not None and len(memory.buffer) > 8:
                         try:
                             batch = memory.sample(12)
-                            z_list = [
-                                e.latent.to(torch.float64).reshape(-1)
-                                for e in batch
-                                if e.latent is not None and e.latent.numel() == predictor.latent_dim
-                            ]
-                            action_list = [
-                                e.action for e in batch
-                                if e.latent is not None and e.latent.numel() == predictor.latent_dim
-                            ]
+                            z_list = [e.latent.to(torch.float64).reshape(-1) for e in batch
+                                      if e.latent is not None and e.latent.numel() == predictor.latent_dim]
+                            action_list = [e.action for e in batch
+                                           if e.latent is not None and e.latent.numel() == predictor.latent_dim]
                             if len(z_list) >= 2:
                                 z_batch = torch.stack(z_list)
                                 actions = torch.tensor(action_list, dtype=torch.float64)
                                 tm, ts = actions.mean(), actions.std() + 1e-6
                                 target = ((actions - tm) / ts).unsqueeze(1)
                                 with torch.no_grad():
-                                    recent_pred_loss = float(
-                                        torch.mean((predictor(z_batch) - target) ** 2).item()
-                                    )
+                                    recent_pred_loss = float(torch.mean((predictor(z_batch) - target) ** 2).item())
                         except Exception:
                             pass
 
@@ -612,15 +665,12 @@ def main():
 
                     recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
                     finite_dh = [d for d in recent_dh if math.isfinite(d)]
-                    recent_abs_dh = (
-                        sum(abs(d) for d in finite_dh) / max(1, len(finite_dh))
-                        if finite_dh else 0.0
-                    )
+                    recent_abs_dh = sum(abs(d) for d in finite_dh) / max(1, len(finite_dh)) if finite_dh else 0.0
                     acceptance_rate = res["acceptance_rate"]
 
                     health = _compute_health(
                         mem_stats, att_stats, recent_pred_loss,
-                        acceptance_rate, recent_abs_dh, last_geometry_loss
+                        acceptance_rate, recent_abs_dh, last_geometry_loss,
                     )
 
                     aurora_mode = drive.mode if drive is not None else "off"
@@ -680,7 +730,12 @@ def main():
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
                 dh = res["delta_h"]
                 dh_s = f"{dh:+.4f}" if math.isfinite(dh) else "nan"
-                print(f"traj {t:02d} | dH={dh_s} | {status} (rate={res['acceptance_rate']:.2f})")
+                extra = ""
+                if "md_cg_iters" in res:
+                    extra = f" | CG={res['md_cg_iters']}"
+                elif "action_cg_iters" in res:
+                    extra = f" | CG={res['action_cg_iters']}"
+                print(f"traj {t:02d} | dH={dh_s} | {status} (rate={res['acceptance_rate']:.2f}){extra}")
 
     except KeyboardInterrupt:
         interrupted = True
