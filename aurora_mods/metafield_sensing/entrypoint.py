@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-metafield_sensing / entrypoint.py  (v0.2.1)
+metafield_sensing / entrypoint.py  (v0.2.2)
 
 MetaField sensing integration mod for Aurora Swarm.
 
 Reads local stats export only (file-based). No Redis / network publish
 until control token + overlord security overlay are fully in place.
 
-Schema v3 (from MetaField >= 1.48) includes geometry train loss + curvature.
+Schema v3+ includes geometry train loss + curvature.
+Clean shutdown now writes health="stopped" so we don't report zombie data.
 """
 
 from typing import Dict, Any, Optional
@@ -59,13 +60,16 @@ def get_metafield_stats() -> Dict[str, Any]:
             "live": False,
         }
 
-    # Normalize for schema v1–v3
+    health = data.get("health", "unknown")
+    # Explicit stopped signal from clean lock release
+    live = data.get("live", health not in ("stopped", "no_export"))
+
     schema = data.get("schema_version", 1)
     return {
         "schema_version": schema,
         "version": data.get("version", "unknown"),
         "traj": data.get("traj"),
-        "health": data.get("health", "unknown"),
+        "health": health,
         "memory": data.get("memory", {}),
         "attractors": data.get("attractors", {}),
         "prediction": data.get("prediction", {}),
@@ -74,7 +78,8 @@ def get_metafield_stats() -> Dict[str, Any]:
         "aurora": data.get("aurora", {}),
         "control_enabled": data.get("control_enabled", control_enabled()),
         "source": str(STATS_PATH),
-        "live": True,
+        "live": live,
+        "stopped_at": data.get("stopped_at"),
     }
 
 
@@ -88,7 +93,12 @@ def on_sensing_tick(context: Any = None) -> None:
     stats = get_metafield_stats()
 
     if not stats.get("live"):
-        print("[metafield_sensing] no live export yet")
+        health = stats.get("health", "no_export")
+        if health == "stopped":
+            stopped = stats.get("stopped_at", "?")
+            print(f"[metafield_sensing] process stopped (at {stopped})")
+        else:
+            print("[metafield_sensing] no live export yet")
         return
 
     mem = stats.get("memory", {})
@@ -135,7 +145,7 @@ def register() -> None:
     print("[metafield_sensing] Registering hooks (local-file mode, no Redis)...")
     print("[metafield_sensing] Control surface: "
           + ("enabled" if control_enabled() else "disabled"))
-    print("[metafield_sensing] Ready (read-only local stats, schema v3)")
+    print("[metafield_sensing] Ready (read-only local stats, schema v3+)")
 
 
 if __name__ == "__main__":

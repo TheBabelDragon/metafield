@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.48
+meta_field_distributed.py v1.49
 
 Aurora environment feed (read-only): start prompt + live drive force.
 Security overlay + continuous singleton lock retained.
 Richer local stats export for sensing (file-only).
-Attractor → geometry deformation loop now active.
+Attractor → geometry deformation loop active.
+Clean shutdown writes health=stopped so sensing is not lied to.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.48"
+VERSION = "1.49"
 
 
 def get_real_lan_ip() -> str:
@@ -434,7 +435,11 @@ def main():
 
             if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
                 if geometry is None:
-                    geometry = LearnedInformationGeometry(input_dim=hmc.field_samples[0].shape[0], latent_dim=8)
+                    geometry = LearnedInformationGeometry(
+                        input_dim=hmc.field_samples[0].shape[0],
+                        latent_dim=8,
+                        attractor_weight=0.4,
+                    )
 
                 with torch.no_grad():
                     z = geometry.encode(hmc.field_samples[-1])
@@ -483,9 +488,7 @@ def main():
                     for e in batch:
                         e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
 
-                    # === NEW: close the attractor → geometry deformation loop ===
-                    # Train the autoencoder on recent samples, guided by current attractors.
-                    # This is the key step that turns memory into manifold deformation.
+                    # Close the attractor → geometry deformation loop
                     landscape = attractor_dyn.get_landscape()
                     if len(recent) >= 4:
                         last_geometry_loss = geometry.train_on_batch(
@@ -494,7 +497,7 @@ def main():
                             attractors=landscape if landscape else None,
                         )
 
-                    # Occasional curvature probe (expensive — only every few cycles)
+                    # Occasional curvature probe (expensive)
                     if t % 100 == 0 and last_geometry_loss is not None:
                         try:
                             with torch.no_grad():
@@ -517,7 +520,6 @@ def main():
                         with torch.no_grad():
                             recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
 
-                    # Recent HMC health signals
                     recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
                     recent_abs_dh = sum(abs(d) for d in recent_dh) / max(1, len(recent_dh))
                     acceptance_rate = res["acceptance_rate"]
@@ -552,6 +554,7 @@ def main():
                             "version": VERSION,
                             "traj": t,
                             "health": health,
+                            "live": True,
                             "hmc": {
                                 "acceptance_rate": acceptance_rate,
                                 "recent_abs_dh": recent_abs_dh,
@@ -581,9 +584,12 @@ def main():
 
     finally:
         if cont_lock is not None:
-            cont_lock.release()
+            # Release is correct and necessary. Leaving the lock held would
+            # block future continuous runs. On clean release we also write
+            # health="stopped" so sensing consumers are not left with zombie data.
+            cont_lock.release(write_stopped_stats=True)
             if rank == 0:
-                print("[Security] Continuous lock released.")
+                print("[Security] Continuous lock released (clean shutdown signaled).")
 
     if rank == 0:
         print("\nRun finished." + (" (interrupted)" if interrupted else ""))

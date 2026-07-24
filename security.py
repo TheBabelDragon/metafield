@@ -12,6 +12,13 @@ Goals:
 
 This is intentionally conservative so Aurora merge can proceed without
 opening unauthenticated channels.
+
+Lock design note:
+  Releasing the lock on clean exit is *correct*. Leaving it held would
+  block future continuous runs until someone manually deleted a stale
+  file. The acquire path already detects dead PIDs and cleans them.
+  SIGKILL is the only case that leaves a stale lock, and the next
+  acquire recovers automatically.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import atexit
 import json
 import os
 import secrets
+import socket
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -60,6 +68,9 @@ class ContinuousLock:
 
     Prevents two continuous MetaField processes from running at once
     on the same machine (duplicate continuous path).
+
+    Release on clean exit is intentional and correct. The acquire path
+    recovers from stale locks left by SIGKILL / crashes.
     """
 
     def __init__(self, path: Path = LOCK_PATH):
@@ -71,30 +82,45 @@ class ContinuousLock:
             try:
                 data = json.loads(self.path.read_text())
                 old_pid = int(data.get("pid", -1))
+                old_host = data.get("hostname", "?")
             except Exception:
                 old_pid = -1
+                old_host = "?"
 
             if old_pid > 0 and _pid_alive(old_pid):
                 raise ContinuousLockError(
                     f"Another continuous MetaField is already running "
-                    f"(pid={old_pid}, lock={self.path}). "
-                    f"Duplicate continuous path is prohibited."
+                    f"(pid={old_pid}, host={old_host}, lock={self.path}). "
+                    f"Duplicate continuous path is prohibited. "
+                    f"If you are sure it is dead, remove the lock file."
                 )
             # Stale lock from a dead process — remove it
             try:
                 self.path.unlink(missing_ok=True)
+                print(f"[Security] Cleaned stale continuous lock "
+                      f"(old pid={old_pid}, host={old_host})")
             except Exception:
                 pass
 
         payload = {
             "pid": os.getpid(),
+            "hostname": socket.gethostname(),
             "started": _now_iso(),
         }
-        self.path.write_text(json.dumps(payload, indent=2))
+        # Atomic-ish write: temp then replace
+        tmp = self.path.with_suffix(".lock.tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(self.path)
         self.held = True
         atexit.register(self.release)
 
-    def release(self) -> None:
+    def release(self, write_stopped_stats: bool = True) -> None:
+        """
+        Release the lock. Only deletes the lock file if *this* process owns it.
+
+        Optionally writes a final health="stopped" stats snapshot so sensing
+        consumers don't keep reporting stale live data after clean exit.
+        """
         if not self.held:
             return
         try:
@@ -105,6 +131,17 @@ class ContinuousLock:
         except Exception:
             pass
         self.held = False
+
+        if write_stopped_stats:
+            try:
+                # Best-effort: mark the process as gone so sensing is not lied to
+                existing = read_local_stats() or {}
+                existing["health"] = "stopped"
+                existing["live"] = False
+                existing["stopped_at"] = _now_iso()
+                write_local_stats(existing)
+            except Exception:
+                pass
 
 
 def _pid_alive(pid: int) -> bool:

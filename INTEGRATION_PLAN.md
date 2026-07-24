@@ -1,14 +1,17 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.48**
+**Updated for v1.49**
 
 ---
 
-## Current status (v1.48)
+## Current status (v1.49)
 
 ### Done
 - Soft expandable episodic memory + force-based attractors + homeostasis + adaptive basins
 - Continuous singleton lock (duplicate continuous prohibited)
+  - Acquire recovers from stale locks (dead PID)
+  - Release on clean exit is intentional and correct
+  - Clean release also writes `health="stopped"` so sensing is not left with zombie data
 - Control surface fail-closed (`METAFIELD_CONTROL_TOKEN`)
 - Local stats export (`--export-stats`) — file only, no Redis publish
 - **Aurora environment feed (read-only)**
@@ -19,17 +22,26 @@
   - HMC acceptance rate + recent |ΔH|
   - Geometry reconstruction error + train loss
   - Occasional scalar curvature probe
-  - Clear health string derived from multiple signals
-  - Versioned schema + improved `metafield_sensing` mod (0.2.1)
-- **Attractor → geometry deformation loop is now active**
+  - Clear health string + explicit `live` / `stopped` signals
+  - Versioned schema + improved `metafield_sensing` mod (0.2.2)
+- **Attractor → geometry deformation loop is active**
   - High-interestingness experiences reinforce attractors
   - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
-  - This is the first concrete step from "memory as stored states" toward "memory as deformation of the manifold"
+  - Attractor influence weight increased to 0.4
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels
 - Overlord remote commands (requires control token + explicit design)
 - Scheduler task wrapper for HMC continuous runs
+
+---
+
+## Continuous lock design note
+
+**Releasing the lock on clean exit is correct.**  
+Leaving it held would block the next continuous run until someone manually deleted a stale file. The acquire path already detects dead PIDs and cleans them. The only case that leaves a stale lock is hard kill (SIGKILL); the next acquire recovers automatically.
+
+On clean release we also write a final stats snapshot with `health="stopped"` so sensing consumers do not keep reporting stale live data.
 
 ---
 
@@ -59,7 +71,7 @@ Without Redis, MetaField still runs; feed reports unavailable and drive force st
 python meta_field_distributed.py --world-size 1 --diagnostic --continuous --export-stats --summary-interval 30
 ```
 
-Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. This is the safe, observable bridge until authenticated publish is ready.
+Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. On clean exit the same file is updated to `health="stopped"`.
 
 ---
 

@@ -51,9 +51,11 @@ class LearnedInformationGeometry:
     """
 
     def __init__(self, input_dim: int, latent_dim: int = 8,
-                 hidden_dims: tuple = (256, 128), sigma: float = 1.0, lr: float = 3e-4):
+                 hidden_dims: tuple = (256, 128), sigma: float = 1.0, lr: float = 3e-4,
+                 attractor_weight: float = 0.4):
         self.latent_dim = latent_dim
         self.sigma = sigma
+        self.attractor_weight = attractor_weight
         dtype = torch.float64
 
         enc_dims = [input_dim, *hidden_dims, latent_dim]
@@ -87,7 +89,7 @@ class LearnedInformationGeometry:
             x_hat = self.decoder(z)
             recon_loss = torch.mean((x_hat - x) ** 2)
 
-            # Soft attractor influence
+            # Soft attractor influence — memory deforms the manifold
             attractor_loss = torch.tensor(0.0, dtype=torch.float64)
             if attractors:
                 for att_latent, strength in attractors:
@@ -101,7 +103,7 @@ class LearnedInformationGeometry:
                         weighted_recon = (weights * torch.mean((x_hat - x) ** 2, dim=1)).sum() / weights.sum()
                         attractor_loss = attractor_loss + weighted_recon
 
-            loss = recon_loss + 0.3 * attractor_loss
+            loss = recon_loss + self.attractor_weight * attractor_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -136,7 +138,7 @@ class LearnedInformationGeometry:
         G = self.fisher_metric(z)
         try:
             G_inv = torch.linalg.inv(G + eps * torch.eye(G.shape[0], dtype=G.dtype))
-        except:
+        except Exception:
             return float('nan')
 
         dim = self.latent_dim
