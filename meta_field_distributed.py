@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.41
+meta_field_distributed.py v1.42
 
-Force-based Attractor Dynamics + Homeostasis.
-Total memory energy budget regulates the landscape.
+Force-based Attractor Dynamics + Homeostasis + Adaptive Basins.
 """
 
 from __future__ import annotations
@@ -66,11 +65,11 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.41 (Attractor Dynamics + Homeostasis)")
+    print("  MetaField Distributed v1.42 (Adaptive Basins)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTOR LANDSCAPE + HOMEOSTASIS]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + HOMEOSTASIS + BASINS]")
     print()
 
 
@@ -480,7 +479,8 @@ def main():
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
                         f"(E={energy:.1f}/{budget:.0f}, "
                         f"str={att_stats.get('avg_strength', 0):.2f}, "
-                        f"r={att_stats.get('avg_radius', 0):.2f}) | "
+                        f"r={att_stats.get('avg_radius', 0):.2f}, "
+                        f"cons={att_stats.get('avg_consistency', 0):.2f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f}",
                         end=""
                     )
