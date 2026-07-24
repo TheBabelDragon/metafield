@@ -4,6 +4,7 @@ attractors.py
 
 Force-based Attractor Dynamics with Homeostasis and Adaptive Basins.
 Supports external energy_scale drive force (e.g. from Aurora feed).
+Hard cap prevents pathological O(n²) growth.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import torch
 class Attractor:
     def __init__(self, position: torch.Tensor, strength: float = 1.0,
                  radius: float = 0.5):
-        self.position = position.detach().cpu().clone().to(torch.float64)
+        self.position = position.detach().cpu().clone().to(torch.float64).flatten()
         self.strength = float(strength)
         self.radius = float(radius)
         self.age = 0
@@ -33,6 +34,8 @@ class Attractor:
 
         if new_position is not None:
             new_pos = new_position.detach().cpu().to(torch.float64).flatten()
+            if new_pos.shape != self.position.shape:
+                return  # shape mismatch — ignore rather than crash
             delta = new_pos - self.position
             dist = torch.norm(delta).item()
 
@@ -57,12 +60,15 @@ class Attractor:
             self.radius = max(0.2, self.radius * 0.999)
 
     def distance_to(self, other: "Attractor") -> float:
+        if self.position.shape != other.position.shape:
+            return float("inf")
         return torch.norm(self.position - other.position).item()
 
 
 class AttractorDynamics:
     def __init__(self,
                  soft_attractor_target: int = 80,
+                 hard_cap: int = 120,
                  energy_budget: float = 80.0,
                  merge_tolerance: float = 0.15,
                  attraction_scale: float = 0.8,
@@ -71,6 +77,7 @@ class AttractorDynamics:
                  min_strength: float = 0.15):
         self.attractors: List[Attractor] = []
         self.soft_attractor_target = soft_attractor_target
+        self.hard_cap = hard_cap
         self.base_energy_budget = energy_budget
         self.energy_budget = energy_budget
         self.energy_scale = 1.0
@@ -81,7 +88,6 @@ class AttractorDynamics:
         self.min_strength = min_strength
 
     def set_drive_scale(self, energy_scale: float = 1.0):
-        """Aurora drive force adjusts effective energy budget."""
         self.energy_scale = max(0.5, min(1.5, float(energy_scale)))
         self.energy_budget = self.base_energy_budget * self.energy_scale
 
@@ -98,9 +104,16 @@ class AttractorDynamics:
             self.attractors.append(Attractor(latent, strength=1.0 + 0.5 * interestingness))
             return
 
-        distances = [torch.norm(a.position - latent).item() for a in self.attractors]
+        # Filter to matching dimensionality
+        valid = [a for a in self.attractors if a.position.shape == latent.shape]
+        if not valid:
+            self.attractors.append(Attractor(latent, strength=1.0 + 0.5 * interestingness))
+            self._enforce_cap()
+            return
+
+        distances = [torch.norm(a.position - latent).item() for a in valid]
         nearest_idx = min(range(len(distances)), key=lambda i: distances[i])
-        nearest = self.attractors[nearest_idx]
+        nearest = valid[nearest_idx]
         dist = distances[nearest_idx]
 
         if dist < nearest.radius * 1.8:
@@ -117,13 +130,22 @@ class AttractorDynamics:
                 if strength > self.attractors[0].strength:
                     self.attractors[0] = Attractor(latent, strength=strength)
 
+        self._enforce_cap()
+
+    def _enforce_cap(self):
+        if len(self.attractors) > self.hard_cap:
+            self.attractors.sort(key=lambda a: a.strength, reverse=True)
+            self.attractors = self.attractors[: self.hard_cap]
+
     def _pairwise_force(self, a: Attractor, b: Attractor) -> torch.Tensor:
+        if a.position.shape != b.position.shape:
+            return torch.zeros_like(a.position)
         delta = b.position - a.position
         dist = torch.norm(delta).item() + 1e-8
         direction = delta / dist
 
         r_sum = a.radius + b.radius
-        strength_factor = math.sqrt(a.strength * b.strength)
+        strength_factor = math.sqrt(max(0.0, a.strength) * max(0.0, b.strength))
 
         attract = self.attraction_scale * strength_factor * math.exp(
             -((dist - 0.6 * r_sum) ** 2) / (0.4 * r_sum + 1e-6)
@@ -179,10 +201,13 @@ class AttractorDynamics:
         self._emergent_merge()
 
         self.attractors = [a for a in self.attractors if a.strength >= self.min_strength]
+        self._enforce_cap()
 
     def _emergent_merge(self):
         merged = True
-        while merged and len(self.attractors) >= 2:
+        safety = 0
+        while merged and len(self.attractors) >= 2 and safety < 200:
+            safety += 1
             merged = False
             n = len(self.attractors)
             for i in range(n):
@@ -219,6 +244,7 @@ class AttractorDynamics:
             return {
                 "num_attractors": 0,
                 "soft_target": self.soft_attractor_target,
+                "hard_cap": self.hard_cap,
                 "avg_strength": 0.0,
                 "max_strength": 0.0,
                 "avg_radius": 0.0,
@@ -235,6 +261,7 @@ class AttractorDynamics:
         return {
             "num_attractors": len(self.attractors),
             "soft_target": self.soft_attractor_target,
+            "hard_cap": self.hard_cap,
             "avg_strength": sum(strengths) / len(strengths),
             "max_strength": max(strengths),
             "avg_radius": sum(radii) / len(radii),

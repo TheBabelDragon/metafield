@@ -4,12 +4,7 @@ geometry.py
 
 Learned Information Geometry with support for Persistent Attractor Memory.
 
-The autoencoder can now be gently influenced by attractor centers formed
-from heavily replayed high-interestingness experiences. This begins the
-transition from "memory as stored states" to "memory as deformation of
-the manifold".
-
-v1.51: practical geometry diagnostics (cheap Fisher signals + optional curvature).
+v1.53: safer Fisher diagnostics (bounded cost), robust encode/train.
 """
 
 from typing import List, Tuple, Optional, Any, Dict
@@ -31,7 +26,6 @@ except ImportError:
 
 
 class _MLP(nn.Module):
-    """Internal MLP helper. Not part of the public API."""
     def __init__(self, dims, dtype=torch.float64):
         super().__init__()
         layers = []
@@ -49,20 +43,24 @@ class LearnedInformationGeometry:
     """
     Autoencoder-based learned geometry on field configurations.
 
-    Supports a soft attractor influence: high-strength attractors gently
-    pull the latent space so those regions become more stable basins.
+    Supports soft attractor influence so high-interestingness basins
+    deform the manifold.
     """
+
+    # Skip full Fisher jacrev if decoder output exceeds this (memory guard)
+    MAX_FISHER_OUTPUT = 16384
 
     def __init__(self, input_dim: int, latent_dim: int = 8,
                  hidden_dims: tuple = (256, 128), sigma: float = 1.0, lr: float = 3e-4,
                  attractor_weight: float = 0.4):
-        self.latent_dim = latent_dim
-        self.sigma = sigma
-        self.attractor_weight = attractor_weight
+        self.input_dim = int(input_dim)
+        self.latent_dim = int(latent_dim)
+        self.sigma = float(sigma)
+        self.attractor_weight = float(attractor_weight)
         dtype = torch.float64
 
-        enc_dims = [input_dim, *hidden_dims, latent_dim]
-        dec_dims = [latent_dim, *reversed(hidden_dims), input_dim]
+        enc_dims = [self.input_dim, *hidden_dims, self.latent_dim]
+        dec_dims = [self.latent_dim, *reversed(hidden_dims), self.input_dim]
 
         self.encoder = _MLP(enc_dims, dtype=dtype)
         self.decoder = _MLP(dec_dims, dtype=dtype)
@@ -74,20 +72,21 @@ class LearnedInformationGeometry:
 
     def train_on_batch(self, samples: List[torch.Tensor], epochs: int = 30,
                        attractors: Optional[List[Tuple[torch.Tensor, float]]] = None) -> float:
-        """
-        Train the autoencoder on field samples.
-
-        If attractors are provided, a soft attraction loss is added that
-        encourages lower reconstruction error near the attractor centers,
-        weighted by their strength. This is the first form of
-        "memory as deformation of the manifold".
-        """
         if not samples:
             return 0.0
-        x = torch.stack([s.to(torch.float64).reshape(-1) for s in samples
-                         if s.numel() == samples[0].numel()])
+        try:
+            x = torch.stack([
+                s.to(torch.float64).reshape(-1) for s in samples
+                if s.numel() == samples[0].numel()
+            ])
+        except Exception:
+            return self.last_loss if self.last_loss is not None else 0.0
+
         if len(x) < 4:
             return 0.0
+        if x.shape[1] != self.input_dim:
+            # dimension drift — refuse rather than crash
+            return self.last_loss if self.last_loss is not None else 0.0
 
         for _ in range(epochs):
             z = self.encoder(x)
@@ -103,13 +102,19 @@ class LearnedInformationGeometry:
                     dists = torch.norm(z - att_latent.unsqueeze(0), dim=1)
                     weights = torch.exp(-dists * 2.0) * float(strength)
                     if weights.sum() > 1e-8:
-                        weighted_recon = (weights * torch.mean((x_hat - x) ** 2, dim=1)).sum() / weights.sum()
+                        weighted_recon = (
+                            weights * torch.mean((x_hat - x) ** 2, dim=1)
+                        ).sum() / weights.sum()
                         attractor_loss = attractor_loss + weighted_recon
 
             loss = recon_loss + self.attractor_weight * attractor_loss
+            if not torch.isfinite(loss):
+                break
 
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), 1.0)
             self.optimizer.step()
             self.last_loss = float(loss.item())
 
@@ -117,7 +122,12 @@ class LearnedInformationGeometry:
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(torch.float64).reshape(-1)
-        # Ensure batch dim for Linear
+        if x.numel() != self.input_dim:
+            # pad or truncate defensively
+            if x.numel() < self.input_dim:
+                x = torch.nn.functional.pad(x, (0, self.input_dim - x.numel()))
+            else:
+                x = x[: self.input_dim]
         if x.dim() == 1:
             return self.encoder(x.unsqueeze(0)).squeeze(0)
         return self.encoder(x)
@@ -125,8 +135,10 @@ class LearnedInformationGeometry:
     def get_latent_2d(self, samples: List[torch.Tensor]):
         if not samples:
             return None, None
-        x = torch.stack([s.to(torch.float64).reshape(-1) for s in samples
-                         if s.numel() == samples[0].numel()])
+        x = torch.stack([
+            s.to(torch.float64).reshape(-1) for s in samples
+            if s.numel() == samples[0].numel()
+        ])
         with torch.no_grad():
             z = self.encoder(x)
         if HAS_SKLEARN and z.shape[1] > 2 and np is not None:
@@ -140,25 +152,45 @@ class LearnedInformationGeometry:
     def fisher_metric(self, z: torch.Tensor) -> torch.Tensor:
         """Pullback Fisher metric G(z) = (1/σ²) Jᵀ J of the decoder."""
         z = z.to(torch.float64).reshape(-1)
-        if z.dim() == 0 or z.numel() != self.latent_dim:
+        if z.numel() != self.latent_dim:
             raise ValueError(f"z must have shape ({self.latent_dim},), got {tuple(z.shape)}")
+
+        if self.input_dim > self.MAX_FISHER_OUTPUT:
+            # Memory guard: approximate metric via finite differences in latent space
+            return self._fisher_metric_fd(z)
 
         def _decode(zz):
             return self.decoder(zz)
 
-        J = torch.func.jacrev(_decode)(z)  # (output_dim, latent_dim)
+        J = torch.func.jacrev(_decode)(z)
         G = (J.transpose(-1, -2) @ J) / (self.sigma ** 2)
-        # Symmetrize numerically
         G = 0.5 * (G + G.transpose(-1, -2))
         return G
 
-    def geometry_diagnostics(self, z: torch.Tensor) -> Dict[str, float]:
-        """
-        Cheap, always-available geometric signals from the Fisher metric.
+    def _fisher_metric_fd(self, z: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+        """Finite-difference approximation of pullback metric (cheaper for large output)."""
+        dim = self.latent_dim
+        G = torch.zeros(dim, dim, dtype=torch.float64)
+        with torch.no_grad():
+            y0 = self.decoder(z)
+            for i in range(dim):
+                step = torch.zeros(dim, dtype=torch.float64)
+                step[i] = eps
+                yp = self.decoder(z + step)
+                ym = self.decoder(z - step)
+                dy_i = (yp - ym) / (2 * eps)
+                for j in range(i, dim):
+                    stepj = torch.zeros(dim, dtype=torch.float64)
+                    stepj[j] = eps
+                    yp2 = self.decoder(z + stepj)
+                    ym2 = self.decoder(z - stepj)
+                    dy_j = (yp2 - ym2) / (2 * eps)
+                    gij = float(torch.dot(dy_i, dy_j).item()) / (self.sigma ** 2)
+                    G[i, j] = gij
+                    G[j, i] = gij
+        return G
 
-        These are the primary continuous-mode geometry outputs. Full scalar
-        curvature is optional and more expensive (see scalar_curvature).
-        """
+    def geometry_diagnostics(self, z: torch.Tensor) -> Dict[str, float]:
         out: Dict[str, float] = {
             "train_loss": float(self.last_loss) if self.last_loss is not None else float("nan"),
             "metric_trace": float("nan"),
@@ -166,11 +198,8 @@ class LearnedInformationGeometry:
             "metric_condition": float("nan"),
         }
         try:
-            with torch.no_grad():
-                # We need grads through jacrev, so briefly enable
-                z = z.detach().to(torch.float64).reshape(-1)
+            z = z.detach().to(torch.float64).reshape(-1)
             G = self.fisher_metric(z)
-            # Eigenvalues of the metric
             evals = torch.linalg.eigvalsh(G + 1e-8 * torch.eye(G.shape[0], dtype=G.dtype))
             evals = evals.clamp_min(1e-12)
             out["metric_trace"] = float(evals.sum().item())
@@ -181,12 +210,6 @@ class LearnedInformationGeometry:
         return out
 
     def scalar_curvature(self, z: torch.Tensor, n_points: int = 4, eps: float = 1e-3) -> float:
-        """
-        Approximate scalar curvature at z.
-
-        Intentionally kept light (small n_points) so continuous mode stays
-        responsive. Prefer geometry_diagnostics() for routine monitoring.
-        """
         try:
             z = z.detach().to(torch.float64).reshape(-1)
             G = self.fisher_metric(z)
@@ -195,7 +218,6 @@ class LearnedInformationGeometry:
 
             dim = self.latent_dim
             total = 0.0
-            # Use a fixed small set of random directions for stability
             gen = torch.Generator().manual_seed(0)
             for _ in range(n_points):
                 z_point = z + torch.randn(dim, generator=gen, dtype=z.dtype) * 0.03
