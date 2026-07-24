@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.56
+meta_field_distributed.py v1.57
 
-Force-sign fix: momentum update is P += -ε(iF) so that dK ≈ -dS.
+Fermion HMC defaults retuned for acceptance efficiency:
+  step=2.5e-4, leapfrog=60, τ=0.015  (from observed |dH|~1-6 at 5e-4)
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.56"
+VERSION = "1.57"
 HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
@@ -98,8 +99,10 @@ def parse_args():
     p.add_argument("--summary-interval", type=int, default=30)
     p.add_argument("--export-stats", action="store_true", default=False)
     p.add_argument("--aurora-feed", action="store_true", default=False)
-    p.add_argument("--hmc-step", type=float, default=None)
-    p.add_argument("--hmc-leapfrog", type=int, default=None)
+    p.add_argument("--hmc-step", type=float, default=None,
+                   help="HMC step size (default: 2.5e-4 fermions / 1.2e-2 quenched)")
+    p.add_argument("--hmc-leapfrog", type=int, default=None,
+                   help="Leapfrog steps (default: 60 fermions / 20 quenched)")
     return p.parse_args()
 
 
@@ -250,10 +253,6 @@ class DistributedGaugeField:
         return self.config.beta * total
 
     def force(self, U=None):
-        """Algebra-valued force F such that dP/dt = -iF keeps H conserved.
-
-        F is traceless anti-Hermitian.  The leapfrog step uses P += -ε(iF).
-        """
         if U is None:
             U = self.U
         U_req = U.detach().clone().requires_grad_(True)
@@ -403,7 +402,7 @@ class DistributedHMC:
             f_norm = float(torch.sqrt(torch.sum((F.conj() * F).real)).item())
             print(f"  [Diag] |F|≈{f_norm:.4e}  step={eps}  leapfrog={cfg.hmc_n_leapfrog}  τ={eps * cfg.hmc_n_leapfrog:.4f}")
 
-        # CRITICAL: minus sign so dP/dt = -∂S  →  dK ≈ -dS
+        # Minus sign: dP/dt = -∂S → dK ≈ -dS
         P = P - 0.5 * eps * (1j * F)
 
         for step in range(cfg.hmc_n_leapfrog):
@@ -507,9 +506,11 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
+    # Tuned from observed |dH|~1-6 at ε=5e-4 → target |dH|≲1
+    # Integrator error ~ O(ε²); ε' = ε/2 → |dH|' ≈ |dH|/4
     if args.include_fermions:
-        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 40
-        step_size = args.hmc_step if args.hmc_step is not None else 0.0005
+        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 60
+        step_size = args.hmc_step if args.hmc_step is not None else 0.00025
     else:
         leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
         step_size = args.hmc_step if args.hmc_step is not None else 0.012
@@ -561,6 +562,7 @@ def main():
         print(f"  lattice={config.L}^4  leapfrog={leapfrog}  step={step_size}  τ={leapfrog * step_size:.4f}")
         if config.include_fermions:
             print(f"  CG tol_md={config.cg_tol_md}  tol_action={config.cg_tol_action}")
+            print(f"  target: |dH|≲1 → accept ~50-70%")
         print()
 
     interrupted = False
