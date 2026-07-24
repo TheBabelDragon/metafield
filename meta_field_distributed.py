@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.54
+meta_field_distributed.py v1.55
 
-Fixes for 0% acceptance under dynamical fermions:
-- Correct lattice extent when world_size==1 (no spurious halo)
-- Interior-only action/kinetic when padded
-- Much smaller MD step when fermions are on
+Fermion HMC retuned: smaller step, tighter MD CG, ΔK/ΔS diagnostics.
 """
 
 from __future__ import annotations
@@ -38,7 +35,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.54"
+VERSION = "1.55"
 HISTORY_MAX = 512
 FIELD_SAMPLE_MAX = 64
 
@@ -101,10 +98,8 @@ def parse_args():
     p.add_argument("--summary-interval", type=int, default=30)
     p.add_argument("--export-stats", action="store_true", default=False)
     p.add_argument("--aurora-feed", action="store_true", default=False)
-    p.add_argument("--hmc-step", type=float, default=None,
-                   help="Override HMC step size (default: auto by fermion mode)")
-    p.add_argument("--hmc-leapfrog", type=int, default=None,
-                   help="Override number of leapfrog steps")
+    p.add_argument("--hmc-step", type=float, default=None)
+    p.add_argument("--hmc-leapfrog", type=int, default=None)
     return p.parse_args()
 
 
@@ -141,7 +136,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def cg_solve(matvec: Callable, b: torch.Tensor, x0=None, tol=1e-8, maxiter=200):
+def cg_solve(matvec: Callable, b: torch.Tensor, x0=None, tol=1e-8, maxiter=500):
     x = torch.zeros_like(b) if x0 is None else x0.clone()
     r = b - matvec(x)
     p = r.clone()
@@ -175,11 +170,8 @@ class DistributedLattice:
                 f"Choose L that divides evenly (e.g. L=4 with world_size=1 or 2)."
             )
         self.local_L = self.L // world_size
-        # Critical: no halo padding for single-rank (true L^4 with roll BC)
         self.halo = 0 if world_size == 1 else 1
-        self.local_padded_shape = (
-            self.local_L + 2 * self.halo, self.L, self.L, self.L
-        )
+        self.local_padded_shape = (self.local_L + 2 * self.halo, self.L, self.L, self.L)
         self.local_volume = self.local_L * (self.L ** 3)
         self.global_volume = self.L ** 4
         self.left_neighbor = (rank - 1) % world_size
@@ -188,7 +180,6 @@ class DistributedLattice:
         self.dtype = config.dtype
 
     def interior_slice(self):
-        """Slice that selects physical (non-halo) sites along axis 0."""
         if self.halo == 0:
             return slice(None)
         return slice(self.halo, self.halo + self.local_L)
@@ -220,7 +211,6 @@ class DistributedLattice:
         return s
 
     def sum_interior(self, field):
-        """Sum a scalar field over physical sites only, then all-reduce."""
         sl = self.interior_slice()
         local = field[sl].sum() if field.dim() >= 1 else field
         return self.global_sum(local)
@@ -237,7 +227,6 @@ class DistributedGaugeField:
         self.U = expm_anti_hermitian(project_traceless_antihermitian(X)) @ eye
 
     def plaquette_traces(self, U=None):
-        """Per-site sum of ReTr(U_p)/N over the 6 planes. Includes halo sites."""
         if U is None:
             U = self.U
         lat = self.lattice
@@ -250,14 +239,12 @@ class DistributedGaugeField:
                 plaq = U_mu @ U_nu_xpm @ dagger(U_mu_xpn) @ dagger(U[..., nu, :, :])
                 tr = torch.diagonal(plaq, -2, -1).sum(-1).real / self.config.color_dim
                 acc = tr if acc is None else acc + tr
-        return acc  # shape: lattice sites
+        return acc
 
     def wilson_action(self, U=None):
-        """S_G = β Σ_p (1 - ReTr/N) over physical sites only."""
         if U is None:
             U = self.U
-        traces = self.plaquette_traces(U)  # sum over 6 planes per site
-        # 6 planes → S = β * sum_sites sum_planes (1 - tr) = β * sum_sites (6 - traces)
+        traces = self.plaquette_traces(U)
         per_site = 6.0 - traces
         total = self.lattice.sum_interior(per_site)
         return self.config.beta * total
@@ -326,17 +313,14 @@ class DistributedPseudofermionField:
     def solve(self, U, tol, x0=None):
         def matvec(v):
             return self.dirac.normal_op(v, U)
-        x, iters, resid = cg_solve(
-            matvec, self.phi, x0=x0, tol=tol,
-            maxiter=getattr(self.config, "cg_maxiter", 200),
-        )
+        maxiter = getattr(self.config, "cg_maxiter", 500)
+        x, iters, resid = cg_solve(matvec, self.phi, x0=x0, tol=tol, maxiter=maxiter)
         self.last_cg = {"iters": iters, "resid": resid}
         return x, iters, resid
 
     def action(self, x, U):
         Dx = self.dirac.apply(x, U)
-        # Sum |Dx|^2 over physical sites only
-        dens = (Dx.conj() * Dx).real.sum(dim=(-1, -2))  # per site
+        dens = (Dx.conj() * Dx).real.sum(dim=(-1, -2))
         return self.lattice.sum_interior(dens)
 
     def force(self, x, U):
@@ -368,24 +352,22 @@ class DistributedHMC:
             del lst[: len(lst) - maxlen]
 
     def _kinetic(self, P):
-        """(1/2) Tr(P²) summed over physical sites only."""
-        # P shape: lattice + (4, N, N)
-        dens = 0.5 * (P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real  # per site, per dir
-        dens = dens.sum(dim=-1)  # sum over 4 directions → per site
+        dens = 0.5 * (P @ P).diagonal(dim1=-2, dim2=-1).sum(-1).real
+        dens = dens.sum(dim=-1)
         return self.lattice.sum_interior(dens)
 
     def _force_at(self, U, pf_x0=None):
         F = self.gauge.force(U)
         pf_x = None
         if self.pseudo is not None:
-            tol = getattr(self.config, "cg_tol_md", 1e-6)
+            # Tight MD tolerance — force/action consistency matters for ΔH
+            tol = getattr(self.config, "cg_tol_md", 1e-8)
             pf_x, iters, resid = self.pseudo.solve(U, tol=tol, x0=pf_x0)
             self.last_cg_stats = {"md_cg_iters": iters, "md_cg_resid": resid}
             F = F + self.pseudo.force(pf_x, U)
         return F, pf_x
 
-    def _hamiltonian(self, U, P, pf_x0=None):
-        kinetic = self._kinetic(P)
+    def _potential(self, U, pf_x0=None):
         potential = self.gauge.wilson_action(U)
         pf_x = None
         if self.pseudo is not None:
@@ -393,7 +375,7 @@ class DistributedHMC:
             pf_x, iters, resid = self.pseudo.solve(U, tol=tol, x0=pf_x0)
             self.last_cg_stats = {"action_cg_iters": iters, "action_cg_resid": resid}
             potential = potential + self.pseudo.action(pf_x, U)
-        return kinetic + potential, pf_x
+        return potential, pf_x
 
     def trajectory(self):
         cfg, lat = self.config, self.lattice
@@ -403,19 +385,20 @@ class DistributedHMC:
         if self.pseudo is not None:
             self.pseudo.refresh(U0)
 
-        H0, pf_x = self._hamiltonian(U0, P0)
+        K0 = self._kinetic(P0)
+        S0, pf_x = self._potential(U0)
+        H0 = K0 + S0
 
         if self.diagnostic and lat.rank == 0:
-            print(f"  [Diag] Start H = {float(H0.real):.4f}")
+            print(f"  [Diag] Start H={float(H0.real):.4f}  (K={float(K0.real):.2f} S={float(S0.real):.2f})")
 
         U, P = U0.clone(), P0.clone()
         eps = cfg.hmc_step_size
 
         F, pf_x = self._force_at(U, pf_x0=pf_x)
         if self.diagnostic and lat.rank == 0 and self.n_total == 0:
-            # One-shot force scale report for tuning
             f_norm = float(torch.sqrt(torch.sum((F.conj() * F).real)).item())
-            print(f"  [Diag] |F| ≈ {f_norm:.4e}  (step={eps}, leapfrog={cfg.hmc_n_leapfrog})")
+            print(f"  [Diag] |F|≈{f_norm:.4e}  step={eps}  leapfrog={cfg.hmc_n_leapfrog}  τ={eps * cfg.hmc_n_leapfrog:.4f}")
 
         P = P + 0.5 * eps * (1j * F)
 
@@ -426,13 +409,18 @@ class DistributedHMC:
             coeff = eps if step < cfg.hmc_n_leapfrog - 1 else 0.5 * eps
             P = P + coeff * (1j * F)
 
-        H1, pf_x_final = self._hamiltonian(U, P, pf_x0=pf_x)
+        K1 = self._kinetic(P)
+        S1, pf_x_final = self._potential(U, pf_x0=pf_x)
+        H1 = K1 + S1
         delta_h = float((H1 - H0).real)
+        delta_k = float((K1 - K0).real)
+        delta_s = float((S1 - S0).real)
 
         if self.diagnostic and lat.rank == 0:
-            print(f"  [Diag] End H   = {float(H1.real):.4f} | dH = {delta_h:+.4f}")
+            print(f"  [Diag] End   H={float(H1.real):.4f}  (K={float(K1.real):.2f} S={float(S1.real):.2f})")
+            print(f"  [Diag] dH={delta_h:+.4f}  dK={delta_k:+.4f}  dS={delta_s:+.4f}")
             if self.last_cg_stats:
-                print(f"  [Diag] CG    = {self.last_cg_stats}")
+                print(f"  [Diag] CG={self.last_cg_stats}")
 
         if not math.isfinite(delta_h):
             if self.diagnostic and lat.rank == 0:
@@ -458,6 +446,8 @@ class DistributedHMC:
 
         return {
             "delta_h": delta_h if math.isfinite(delta_h) else float("nan"),
+            "delta_k": delta_k,
+            "delta_s": delta_s,
             "accepted": accepted,
             "acceptance_rate": self.n_accepted / max(1, self.n_total),
             **self.last_cg_stats,
@@ -513,10 +503,10 @@ def main():
 
     hmc_trajectories = 10**9 if args.continuous else 25
 
-    # Tuned defaults: fermion force is much stiffer than pure gauge
+    # Fermion force is stiff; keep τ short and CG tight
     if args.include_fermions:
-        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
-        step_size = args.hmc_step if args.hmc_step is not None else 0.002
+        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 40
+        step_size = args.hmc_step if args.hmc_step is not None else 0.0005
     else:
         leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20
         step_size = args.hmc_step if args.hmc_step is not None else 0.012
@@ -525,6 +515,9 @@ def main():
         L=4, beta=5.5, hmc_n_leapfrog=leapfrog, hmc_step_size=step_size,
         hmc_trajectories=hmc_trajectories,
         include_fermions=args.include_fermions,
+        cg_tol_md=1e-8,
+        cg_tol_action=1e-10,
+        cg_maxiter=500,
         seed=42 + rank, device="cpu", dtype=torch.complex128,
     )
 
@@ -564,7 +557,7 @@ def main():
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...")
         print(f"  lattice={config.L}^4  leapfrog={leapfrog}  step={step_size}  τ={leapfrog * step_size:.4f}")
         if config.include_fermions:
-            print("  (CG solve per force evaluation)")
+            print(f"  CG tol_md={config.cg_tol_md}  tol_action={config.cg_tol_action}")
         print()
 
     interrupted = False
