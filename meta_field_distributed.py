@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.44
+meta_field_distributed.py v1.45
 
-Soft expandable memory capacity for long continuous runs.
-No rigid hard caps on episodic buffer or attractor count.
+Continuous singleton lock + security overlay foundations.
+Duplicate continuous path is prohibited.
 """
 
 from __future__ import annotations
@@ -29,6 +29,12 @@ from memory import EpisodicMemory, EpisodicExperience
 from prediction import LatentPredictor
 from geometry import LearnedInformationGeometry
 from attractors import AttractorDynamics
+from security import (
+    ContinuousLock,
+    ContinuousLockError,
+    write_local_stats,
+    control_enabled,
+)
 
 from meta_field_sim_torch import (
     ConfigV2,
@@ -66,11 +72,13 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.44 (Soft Expandable Capacity)")
+    print("  MetaField Distributed v1.45 (Security Overlay + Continuous Lock)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
         print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + HOMEOSTASIS + BASINS]")
+    ctrl = "enabled" if control_enabled() else "disabled (set METAFIELD_CONTROL_TOKEN to enable)"
+    print(f"   Control surface: {ctrl}")
     print()
 
 
@@ -98,6 +106,8 @@ def parse_args():
     p.add_argument("--continuous", action="store_true", default=False)
     p.add_argument("--summary-interval", type=int, default=50,
                    help="How often to print system summary in continuous mode (default: 50)")
+    p.add_argument("--export-stats", action="store_true", default=False,
+                   help="Write local stats.json snapshot on each summary (file-only, no network)")
     return p.parse_args()
 
 
@@ -346,6 +356,18 @@ def main():
     args = parse_args()
     rank, world_size, master_addr, master_port = init_distributed(args)
 
+    # --- Duplicate continuous path prohibition ---
+    cont_lock = None
+    if args.continuous and rank == 0:
+        cont_lock = ContinuousLock()
+        try:
+            cont_lock.acquire()
+            print("[Security] Continuous singleton lock acquired.")
+        except ContinuousLockError as e:
+            print(f"\n[Security] {e}")
+            print("Refusing to start a second continuous instance.")
+            sys.exit(1)
+
     if args.continuous:
         hmc_trajectories = 10**9
     else:
@@ -492,6 +514,17 @@ def main():
                     else:
                         print()
 
+                    # Optional local stats export (file-only, no network)
+                    if args.export_stats:
+                        write_local_stats({
+                            "traj": t,
+                            "health": health,
+                            "memory": mem_stats,
+                            "attractors": att_stats,
+                            "prediction": {"recent_loss": recent_pred_loss},
+                            "control_enabled": control_enabled(),
+                        })
+
             if rank == 0:
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
                 print(f"traj {t:02d} | dH={res['delta_h']:+.4f} | {status} (rate={res['acceptance_rate']:.2f})")
@@ -500,6 +533,12 @@ def main():
         interrupted = True
         if rank == 0:
             print("\nInterrupted by user (Ctrl+C). Shutting down cleanly...")
+
+    finally:
+        if cont_lock is not None:
+            cont_lock.release()
+            if rank == 0:
+                print("[Security] Continuous singleton lock released.")
 
     if rank == 0:
         print("\nRun finished." + (" (interrupted)" if interrupted else ""))
