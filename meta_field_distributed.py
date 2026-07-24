@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.51
+meta_field_distributed.py v1.52
 
-Aurora environment feed (read-only) + continuous singleton lock.
-Attractor → geometry deformation loop active.
-Reliable geometry diagnostics (train loss + Fisher signals + optional curvature).
-Clean shutdown writes health=stopped. Lock is fully self-healing.
+Hardened continuous path:
+- Bounded histories (no unbounded growth)
+- Aligned predictor / geometry batch sizes
+- Non-finite delta_H guarded
+- Intelligence loop failures cannot kill the run
+- Clearer distributed lattice errors
 """
 
 from __future__ import annotations
@@ -44,7 +46,9 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.51"
+VERSION = "1.52"
+HISTORY_MAX = 512  # bound HMC diagnostic histories in continuous mode
+FIELD_SAMPLE_MAX = 64
 
 
 def get_real_lan_ip() -> str:
@@ -150,7 +154,11 @@ class DistributedLattice:
         self.rank = rank
         self.world_size = world_size
         self.L = config.L
-        assert self.L % world_size == 0
+        if self.L % world_size != 0:
+            raise ValueError(
+                f"Lattice size L={self.L} must be divisible by world_size={world_size}. "
+                f"Choose L that divides evenly (e.g. L=4 with world_size=1 or 2)."
+            )
         self.local_L = self.L // world_size
         self.halo = 1
         self.local_padded_shape = (self.local_L + 2 * self.halo, self.L, self.L, self.L)
@@ -286,6 +294,11 @@ class DistributedHMC:
         self.accepted_history: List[bool] = []
         self.field_samples: List[torch.Tensor] = []
 
+    def _append_bounded(self, lst: list, value, maxlen: int = HISTORY_MAX):
+        lst.append(value)
+        if len(lst) > maxlen:
+            del lst[: len(lst) - maxlen]
+
     def trajectory(self):
         cfg, lat = self.config, self.lattice
         U0 = self.gauge.U.clone()
@@ -320,8 +333,15 @@ class DistributedHMC:
         if self.diagnostic and self.lattice.rank == 0:
             print(f"  [Diag] End Action   = {action1:.4f} | raw dH = {delta_h:+.4f}")
 
-        accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
-        accepted = torch.rand((), generator=self.generator).item() < accept_prob
+        # Guard non-finite delta_H (can appear if force/expm goes sideways)
+        if not math.isfinite(delta_h):
+            if self.diagnostic and self.lattice.rank == 0:
+                print(f"  [Diag] Non-finite delta_H={delta_h}; forcing reject")
+            accept_prob = 0.0
+            accepted = False
+        else:
+            accept_prob = min(1.0, math.exp(-delta_h)) if delta_h < 700 else 0.0
+            accepted = torch.rand((), generator=self.generator).item() < accept_prob
 
         self.n_total += 1
         if accepted:
@@ -329,16 +349,17 @@ class DistributedHMC:
             self.gauge.U = U.clone()
             lat.update_halo_gauge(self.gauge.U)
             if self.diagnostic and self.lattice.rank == 0:
-                # Keep a bounded sample buffer for geometry training
                 sample = self.gauge.U.detach().flatten().real[:8192].to(torch.float64)
-                self.field_samples.append(sample)
-                if len(self.field_samples) > 64:
-                    self.field_samples = self.field_samples[-64:]
+                self._append_bounded(self.field_samples, sample, FIELD_SAMPLE_MAX)
 
-        self.action_history.append(action1)
-        self.delta_h_history.append(delta_h)
-        self.accepted_history.append(accepted)
-        return {"delta_h": delta_h, "accepted": accepted, "acceptance_rate": self.n_accepted / max(1, self.n_total)}
+        self._append_bounded(self.action_history, action1)
+        self._append_bounded(self.delta_h_history, delta_h)
+        self._append_bounded(self.accepted_history, accepted)
+        return {
+            "delta_h": delta_h if math.isfinite(delta_h) else float("nan"),
+            "accepted": accepted,
+            "acceptance_rate": self.n_accepted / max(1, self.n_total),
+        }
 
 
 def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
@@ -400,7 +421,14 @@ def main():
     torch.manual_seed(config.seed)
     gen = torch.Generator().manual_seed(config.seed + rank * 777)
 
-    lat = DistributedLattice(config, rank, world_size)
+    try:
+        lat = DistributedLattice(config, rank, world_size)
+    except ValueError as e:
+        print(f"\n[Config error] {e}")
+        if cont_lock is not None:
+            cont_lock.release(write_stopped_stats=False)
+        sys.exit(1)
+
     gauge = DistributedGaugeField(lat, config, gen)
     dirac = DistributedWilsonDiracOperator(lat, config)
     pseudo = DistributedPseudofermionField(lat, dirac, config, gen) if config.include_fermions else None
@@ -408,12 +436,14 @@ def main():
 
     memory = EpisodicMemory() if (args.diagnostic and rank == 0) else None
     attractor_dyn = AttractorDynamics() if (args.diagnostic and rank == 0) else None
-    predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
-    predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
+    # Predictor latent dim will be aligned when geometry is created
+    predictor = None
+    predictor_optimizer = None
     geometry: Optional[LearnedInformationGeometry] = None
     last_geometry_loss: Optional[float] = None
     last_curvature: Optional[float] = None
     last_geom_diag: Dict[str, float] = {}
+    intel_failures = 0
 
     drive = apply_drive(aurora, memory, attractor_dyn)
     if drive is not None:
@@ -423,30 +453,42 @@ def main():
         mode = "DYNAMICAL + fermions" if config.include_fermions else "QUENCHED"
         run_mode = "CONTINUOUS" if args.continuous else f"{hmc_trajectories} traj"
         print(f"Starting {mode} HMC ({run_mode}) on {world_size} rank(s)...\n")
+        if config.include_fermions:
+            print("[Note] Distributed path currently uses gauge force only; "
+                  "pseudofermion field is refreshed but not yet in the MD force.")
 
     interrupted = False
-    summary_interval = args.summary_interval
+    summary_interval = max(1, args.summary_interval)
 
     try:
         for t in range(config.hmc_trajectories):
             res = hmc.trajectory()
 
             if aurora is not None and rank == 0 and t > 0 and t % summary_interval == 0:
-                drive = apply_drive(aurora, memory, attractor_dyn)
-                if drive is not None:
-                    interest_gate = max(0.5, min(1.2, 0.8 + drive.interest_bias))
+                try:
+                    drive = apply_drive(aurora, memory, attractor_dyn)
+                    if drive is not None:
+                        interest_gate = max(0.5, min(1.2, 0.8 + drive.interest_bias))
+                except Exception as e:
+                    print(f"[aurora] drive update failed: {type(e).__name__}: {e}")
 
             if rank == 0 and args.diagnostic and memory is not None and len(hmc.field_samples) > 0:
                 if geometry is None:
                     geometry = LearnedInformationGeometry(
-                        input_dim=hmc.field_samples[0].shape[0],
+                        input_dim=int(hmc.field_samples[0].shape[0]),
                         latent_dim=8,
                         attractor_weight=0.4,
                     )
+                    predictor = LatentPredictor(latent_dim=8).to(torch.float64)
+                    predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4)
                     print(f"[geometry] Initialized (input_dim={hmc.field_samples[0].shape[0]}, latent_dim=8)")
 
-                with torch.no_grad():
-                    z = geometry.encode(hmc.field_samples[-1])
+                try:
+                    with torch.no_grad():
+                        z = geometry.encode(hmc.field_samples[-1])
+                except Exception as e:
+                    print(f"[geometry] encode failed: {type(e).__name__}: {e}")
+                    z = torch.zeros(8, dtype=torch.float64)
 
                 recon_error = 0.0
                 try:
@@ -460,7 +502,7 @@ def main():
                 exp = EpisodicExperience(
                     latent=z.detach(),
                     action=hmc.action_history[-1] if hmc.action_history else 0.0,
-                    delta_h=res["delta_h"],
+                    delta_h=res["delta_h"] if math.isfinite(res["delta_h"]) else 0.0,
                     accepted=res["accepted"],
                 )
                 exp.update_priority(reconstruction_error=recon_error)
@@ -468,50 +510,67 @@ def main():
 
                 # --- Core intelligence loop (every 25 trajectories) ---
                 if len(memory.buffer) > 8 and t % 25 == 0:
-                    batch = memory.sample(24)
-
-                    if attractor_dyn is not None:
-                        for e in batch:
-                            if e.interestingness > interest_gate:
-                                attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
-                        attractor_dyn.step()
-
-                    # Train predictor
-                    if predictor is not None:
-                        recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
-                        x_batch = torch.stack([s.reshape(-1) for s in recent]).to(torch.float64)
-                        z_batch = geometry.encoder(x_batch)
-                        actions = torch.tensor([e.action for e in batch], dtype=torch.float64)
-                        target_mean, target_std = actions.mean(), actions.std() + 1e-6
-                        target = ((actions - target_mean) / target_std).unsqueeze(1)
-                        pred = predictor(z_batch)
-                        pred_loss = torch.mean((pred - target) ** 2)
-                        predictor_optimizer.zero_grad()
-                        pred_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-                        predictor_optimizer.step()
-                        for e in batch:
-                            e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
-
-                    # Train geometry (attractor-guided)
-                    recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
-                    landscape = attractor_dyn.get_landscape() if attractor_dyn is not None else []
-                    if len(recent) >= 4:
-                        last_geometry_loss = geometry.train_on_batch(
-                            recent,
-                            epochs=12,
-                            attractors=landscape if landscape else None,
-                        )
-
-                    # Cheap Fisher diagnostics every intelligence cycle
                     try:
-                        last_geom_diag = geometry.geometry_diagnostics(z)
-                    except Exception as e:
-                        print(f"[geometry] diagnostics failed: {type(e).__name__}: {e}")
+                        batch = memory.sample(24)
 
-                    # Full curvature less often (expensive)
-                    if t % 100 == 0:
-                        last_curvature = geometry.scalar_curvature(z, n_points=4)
+                        if attractor_dyn is not None:
+                            for e in batch:
+                                if e.interestingness > interest_gate:
+                                    attractor_dyn.reinforce_from_latent(
+                                        e.latent, interestingness=e.interestingness
+                                    )
+                            attractor_dyn.step()
+
+                        # Train predictor on *aligned* batches from the same experiences
+                        if predictor is not None and predictor_optimizer is not None and batch:
+                            z_list = []
+                            action_list = []
+                            for e in batch:
+                                if e.latent is not None and e.latent.numel() == predictor.latent_dim:
+                                    z_list.append(e.latent.to(torch.float64).reshape(-1))
+                                    action_list.append(e.action)
+                            if len(z_list) >= 4:
+                                z_batch = torch.stack(z_list)
+                                actions = torch.tensor(action_list, dtype=torch.float64)
+                                target_mean = actions.mean()
+                                target_std = actions.std() + 1e-6
+                                target = ((actions - target_mean) / target_std).unsqueeze(1)
+                                pred = predictor(z_batch)
+                                pred_loss = torch.mean((pred - target) ** 2)
+                                if math.isfinite(float(pred_loss.item())):
+                                    predictor_optimizer.zero_grad()
+                                    pred_loss.backward()
+                                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+                                    predictor_optimizer.step()
+                                    pl = float(pred_loss.item())
+                                    for e in batch:
+                                        e.update_priority(
+                                            prediction_error=pl,
+                                            reconstruction_error=recon_error,
+                                        )
+
+                        # Train geometry (attractor-guided)
+                        recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
+                        landscape = attractor_dyn.get_landscape() if attractor_dyn is not None else []
+                        if len(recent) >= 4:
+                            last_geometry_loss = geometry.train_on_batch(
+                                recent,
+                                epochs=12,
+                                attractors=landscape if landscape else None,
+                            )
+
+                        try:
+                            last_geom_diag = geometry.geometry_diagnostics(z)
+                        except Exception as e:
+                            print(f"[geometry] diagnostics failed: {type(e).__name__}: {e}")
+
+                        if t % 100 == 0:
+                            last_curvature = geometry.scalar_curvature(z, n_points=4)
+
+                    except Exception as e:
+                        intel_failures += 1
+                        if intel_failures <= 5:
+                            print(f"[intel] cycle failed ({intel_failures}): {type(e).__name__}: {e}")
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
@@ -519,18 +578,28 @@ def main():
                     recent_pred_loss = None
                     if predictor is not None and len(memory.buffer) > 8:
                         try:
-                            recent = hmc.field_samples[-min(12, len(hmc.field_samples)):]
-                            x_batch = torch.stack([s.reshape(-1) for s in recent]).to(torch.float64)
-                            z_batch = geometry.encoder(x_batch)
-                            actions = torch.tensor([e.action for e in memory.sample(12)], dtype=torch.float64)
-                            tm, ts = actions.mean(), actions.std() + 1e-6
-                            target = ((actions - tm) / ts).unsqueeze(1)
-                            with torch.no_grad():
-                                recent_pred_loss = torch.mean((predictor(z_batch) - target) ** 2).item()
+                            batch = memory.sample(12)
+                            z_list = [
+                                e.latent.to(torch.float64).reshape(-1)
+                                for e in batch
+                                if e.latent is not None and e.latent.numel() == predictor.latent_dim
+                            ]
+                            action_list = [
+                                e.action for e in batch
+                                if e.latent is not None and e.latent.numel() == predictor.latent_dim
+                            ]
+                            if len(z_list) >= 2:
+                                z_batch = torch.stack(z_list)
+                                actions = torch.tensor(action_list, dtype=torch.float64)
+                                tm, ts = actions.mean(), actions.std() + 1e-6
+                                target = ((actions - tm) / ts).unsqueeze(1)
+                                with torch.no_grad():
+                                    recent_pred_loss = float(
+                                        torch.mean((predictor(z_batch) - target) ** 2).item()
+                                    )
                         except Exception:
                             pass
 
-                    # Refresh cheap geometry diagnostics at summary time too
                     if geometry is not None and len(hmc.field_samples) > 0:
                         try:
                             with torch.no_grad():
@@ -542,7 +611,11 @@ def main():
                             pass
 
                     recent_dh = hmc.delta_h_history[-min(20, len(hmc.delta_h_history)):]
-                    recent_abs_dh = sum(abs(d) for d in recent_dh) / max(1, len(recent_dh))
+                    finite_dh = [d for d in recent_dh if math.isfinite(d)]
+                    recent_abs_dh = (
+                        sum(abs(d) for d in finite_dh) / max(1, len(finite_dh))
+                        if finite_dh else 0.0
+                    )
                     acceptance_rate = res["acceptance_rate"]
 
                     health = _compute_health(
@@ -563,45 +636,51 @@ def main():
                     )
                     if last_geometry_loss is not None:
                         print(f" | GeomLoss: {last_geometry_loss:.3e}", end="")
-                    if last_geom_diag.get("metric_logdet") is not None and not math.isnan(last_geom_diag.get("metric_logdet", float("nan"))):
-                        print(f" | logdetG: {last_geom_diag['metric_logdet']:.2f}", end="")
-                    if last_curvature is not None and not math.isnan(last_curvature):
+                    logdet = last_geom_diag.get("metric_logdet")
+                    if logdet is not None and math.isfinite(logdet):
+                        print(f" | logdetG: {logdet:.2f}", end="")
+                    if last_curvature is not None and math.isfinite(last_curvature):
                         print(f" | R={last_curvature:.3e}", end="")
-                    if recent_pred_loss is not None:
+                    if recent_pred_loss is not None and math.isfinite(recent_pred_loss):
                         print(f" | PredLoss: {recent_pred_loss:.2e}", end="")
                     print(f" | Aurora: {aurora_mode}")
 
                     if args.export_stats:
-                        write_local_stats({
-                            "schema_version": 4,
-                            "version": VERSION,
-                            "traj": t,
-                            "health": health,
-                            "live": True,
-                            "hmc": {
-                                "acceptance_rate": acceptance_rate,
-                                "recent_abs_dh": recent_abs_dh,
-                                "n_total": hmc.n_total,
-                                "n_accepted": hmc.n_accepted,
-                            },
-                            "memory": mem_stats,
-                            "attractors": att_stats,
-                            "prediction": {"recent_loss": recent_pred_loss},
-                            "geometry": {
-                                "recon_error": recon_error,
-                                "train_loss": last_geometry_loss,
-                                "scalar_curvature": last_curvature,
-                                "metric_trace": last_geom_diag.get("metric_trace"),
-                                "metric_logdet": last_geom_diag.get("metric_logdet"),
-                                "metric_condition": last_geom_diag.get("metric_condition"),
-                            },
-                            "aurora": aurora.get_stats() if aurora else {},
-                            "control_enabled": control_enabled(),
-                        })
+                        try:
+                            write_local_stats({
+                                "schema_version": 4,
+                                "version": VERSION,
+                                "traj": t,
+                                "health": health,
+                                "live": True,
+                                "hmc": {
+                                    "acceptance_rate": acceptance_rate,
+                                    "recent_abs_dh": recent_abs_dh,
+                                    "n_total": hmc.n_total,
+                                    "n_accepted": hmc.n_accepted,
+                                },
+                                "memory": mem_stats,
+                                "attractors": att_stats,
+                                "prediction": {"recent_loss": recent_pred_loss},
+                                "geometry": {
+                                    "recon_error": recon_error,
+                                    "train_loss": last_geometry_loss,
+                                    "scalar_curvature": last_curvature,
+                                    "metric_trace": last_geom_diag.get("metric_trace"),
+                                    "metric_logdet": last_geom_diag.get("metric_logdet"),
+                                    "metric_condition": last_geom_diag.get("metric_condition"),
+                                },
+                                "aurora": aurora.get_stats() if aurora else {},
+                                "control_enabled": control_enabled(),
+                            })
+                        except Exception as e:
+                            print(f"[stats] export failed: {type(e).__name__}: {e}")
 
             if rank == 0:
                 status = "ACCEPTED" if res["accepted"] else "REJECTED"
-                print(f"traj {t:02d} | dH={res['delta_h']:+.4f} | {status} (rate={res['acceptance_rate']:.2f})")
+                dh = res["delta_h"]
+                dh_s = f"{dh:+.4f}" if math.isfinite(dh) else "nan"
+                print(f"traj {t:02d} | dH={dh_s} | {status} (rate={res['acceptance_rate']:.2f})")
 
     except KeyboardInterrupt:
         interrupted = True

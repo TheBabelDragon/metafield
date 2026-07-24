@@ -22,6 +22,7 @@ class LatentPredictor(nn.Module):
 
     def __init__(self, latent_dim: int = 8, hidden_dim: int = 64):
         super().__init__()
+        self.latent_dim = latent_dim
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
@@ -29,4 +30,8 @@ class LatentPredictor(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # Accept (latent_dim,) or (batch, latent_dim)
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+            return self.net(z).squeeze(0)
         return self.net(z)
