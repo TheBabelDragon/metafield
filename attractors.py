@@ -2,14 +2,13 @@
 """
 attractors.py
 
-Force-based Attractor Dynamics with Homeostasis.
+Force-based Attractor Dynamics with Homeostasis and Adaptive Basins.
 
-Attractors interact continuously via attraction and repulsion forces.
-Merge emerges when attractors drift close enough.
-
-Homeostasis: a total memory energy budget prevents unbounded growth.
-When total strength exceeds the budget, weaker attractors decay faster
-and the system is pressured toward consolidation.
+Attractors interact via continuous forces. Merge is emergent.
+Homeostasis keeps total energy near a budget.
+Basin radius and variance adapt to replay consistency:
+  - Coherent replay → basin expands (stable concept)
+  - Noisy / inconsistent observations → basin stays tight or contracts
 
 Layer separation:
   Field → Attractor Dynamics → Geometry Training
@@ -25,7 +24,7 @@ import torch
 
 class Attractor:
     """
-    A single attractor in latent space.
+    A single attractor in latent space with adaptive basin.
 
     State:
       position, strength, radius, age, replay_count, variance
@@ -39,19 +38,48 @@ class Attractor:
         self.age = 0
         self.replay_count = 1
         self.variance = 0.25
+        # Running estimate of how consistent recent observations are
+        self.consistency = 1.0
 
-    def reinforce(self, amount: float = 1.0, new_position: Optional[torch.Tensor] = None):
+    def reinforce(self, amount: float = 1.0,
+                  new_position: Optional[torch.Tensor] = None):
+        """Strengthen and adapt basin based on observation consistency."""
         self.strength += amount
         self.replay_count += 1
         self.age = 0
 
         if new_position is not None:
+            new_pos = new_position.detach().cpu().to(torch.float64).flatten()
+            delta = new_pos - self.position
+            dist = torch.norm(delta).item()
+
+            # Update local variance (exponential moving average)
+            self.variance = 0.9 * self.variance + 0.1 * (dist ** 2)
+
+            # Consistency: how close the new observation is relative to current radius
+            relative = dist / (self.radius + 1e-6)
+            # High consistency when observation lands well inside the basin
+            obs_consistency = math.exp(-relative * 1.5)
+            self.consistency = 0.85 * self.consistency + 0.15 * obs_consistency
+
+            # Soft move toward the observation
             alpha = min(0.3, amount / (self.strength + 1e-6))
-            self.position = (1 - alpha) * self.position + alpha * new_position.detach().cpu().to(torch.float64)
+            self.position = (1 - alpha) * self.position + alpha * new_pos
+
+            # Adaptive radius:
+            # - Consistent replay → slowly expand (stable concept)
+            # - Inconsistent → contract or stay tight
+            if self.consistency > 0.7:
+                self.radius = min(2.5, self.radius + 0.03 * self.consistency)
+            elif self.consistency < 0.35:
+                self.radius = max(0.2, self.radius * 0.97)
 
     def decay(self, factor: float = 0.997):
         self.strength *= factor
         self.age += 1
+        # Very old, rarely reinforced basins slowly shrink
+        if self.age > 50:
+            self.radius = max(0.2, self.radius * 0.999)
 
     def distance_to(self, other: "Attractor") -> float:
         return torch.norm(self.position - other.position).item()
@@ -59,21 +87,7 @@ class Attractor:
 
 class AttractorDynamics:
     """
-    Manages the set of attractors and evolves them via continuous forces
-    under a homeostatic energy budget.
-
-    Forces:
-      - Attraction at moderate distance
-      - Repulsion when too close
-      - Influence scaled by strength
-      - Decay acts as friction
-
-    Homeostasis:
-      Total strength is kept near a target budget.
-      When over budget, weaker attractors decay faster and consolidation
-      is encouraged.
-
-    Merge is emergent when attractors drift below a separation tolerance.
+    Force-based attractor landscape with homeostasis and adaptive basins.
     """
 
     def __init__(self,
@@ -111,9 +125,9 @@ class AttractorDynamics:
         nearest = self.attractors[nearest_idx]
         dist = distances[nearest_idx]
 
+        # Use adaptive radius for membership decision
         if dist < nearest.radius * 1.8:
             nearest.reinforce(amount=0.4 + 0.3 * interestingness, new_position=latent)
-            nearest.radius = min(2.0, nearest.radius + 0.02)
         else:
             strength = 1.0 + 0.5 * interestingness
             if len(self.attractors) < self.max_attractors:
@@ -140,37 +154,23 @@ class AttractorDynamics:
         else:
             repel = 0.0
 
-        force_mag = attract - repel
-        return direction * force_mag
+        return direction * (attract - repel)
 
     def _apply_homeostasis(self):
-        """
-        Enforce approximate total energy budget.
-
-        When over budget:
-        - Accelerate decay on the weakest attractors
-        - Slightly increase pressure toward merge (by temporarily
-          lowering effective merge tolerance via stronger relative decay)
-        """
         total = self.total_energy()
         if total <= self.energy_budget or not self.attractors:
             return
 
         excess = total - self.energy_budget
-        # Fraction of excess to remove this step
         pressure = min(0.25, excess / (total + 1e-8))
 
-        # Sort weakest first
         self.attractors.sort(key=lambda a: a.strength)
-
-        # Stronger decay on the bottom half
         n_weak = max(1, len(self.attractors) // 2)
+
         for i, a in enumerate(self.attractors):
             if i < n_weak:
-                # Extra decay proportional to pressure
                 a.strength *= (1.0 - 0.15 * pressure)
             else:
-                # Mild global pressure
                 a.strength *= (1.0 - 0.03 * pressure)
 
     def step(self):
@@ -181,7 +181,6 @@ class AttractorDynamics:
             self.attractors = [a for a in self.attractors if a.strength >= self.min_strength]
             return
 
-        # Pairwise forces
         forces = [torch.zeros_like(a.position) for a in self.attractors]
 
         for i in range(n):
@@ -193,17 +192,12 @@ class AttractorDynamics:
         for a, f in zip(self.attractors, forces):
             a.position = a.position + self.step_size * f
 
-        # Baseline decay
         for a in self.attractors:
             a.decay()
 
-        # Homeostatic regulation
         self._apply_homeostasis()
-
-        # Emergent merge
         self._emergent_merge()
 
-        # Cull very weak attractors
         self.attractors = [a for a in self.attractors if a.strength >= self.min_strength]
 
     def _emergent_merge(self):
@@ -226,6 +220,8 @@ class AttractorDynamics:
                         new_att = Attractor(new_pos, strength=new_strength, radius=new_radius)
                         new_att.replay_count = a.replay_count + b.replay_count
                         new_att.age = min(a.age, b.age)
+                        new_att.variance = (a.variance + b.variance) / 2
+                        new_att.consistency = (a.consistency + b.consistency) / 2
 
                         self.attractors.pop(j)
                         self.attractors.pop(i)
@@ -246,18 +242,21 @@ class AttractorDynamics:
                 "max_strength": 0.0,
                 "avg_radius": 0.0,
                 "avg_age": 0.0,
+                "avg_consistency": 0.0,
                 "total_energy": 0.0,
                 "energy_budget": self.energy_budget,
             }
         strengths = [a.strength for a in self.attractors]
         radii = [a.radius for a in self.attractors]
         ages = [a.age for a in self.attractors]
+        consistencies = [a.consistency for a in self.attractors]
         return {
             "num_attractors": len(self.attractors),
             "avg_strength": sum(strengths) / len(strengths),
             "max_strength": max(strengths),
             "avg_radius": sum(radii) / len(radii),
             "avg_age": sum(ages) / len(ages),
+            "avg_consistency": sum(consistencies) / len(consistencies),
             "total_energy": sum(strengths),
             "energy_budget": self.energy_budget,
         }
