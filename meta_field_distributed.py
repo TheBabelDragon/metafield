@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.40
+meta_field_distributed.py v1.41
 
-Force-based Attractor Dynamics.
-Attractors interact continuously; merge is emergent.
+Force-based Attractor Dynamics + Homeostasis.
+Total memory energy budget regulates the landscape.
 """
 
 from __future__ import annotations
@@ -66,11 +66,11 @@ def get_real_lan_ip() -> str:
 
 def print_banner(rank: int, world_size: int, role: str, master_addr: str, master_port: int, diagnostic: bool = False):
     print("\n" + "=" * 72)
-    print("  MetaField Distributed v1.40 (Force-based Attractor Dynamics)")
+    print("  MetaField Distributed v1.41 (Attractor Dynamics + Homeostasis)")
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTOR LANDSCAPE]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTOR LANDSCAPE + HOMEOSTASIS]")
     print()
 
 
@@ -420,12 +420,10 @@ def main():
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(16)
 
-                    # Feed high-interest experiences into attractor dynamics
                     for e in batch:
                         if e.interestingness > 0.8:
                             attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
 
-                    # Evolve the attractor landscape
                     attractor_dyn.step()
 
                     recent = hmc.field_samples[-min(16, len(hmc.field_samples)):]
@@ -472,12 +470,16 @@ def main():
                     elif mem_stats.get('size', 0) < 20:
                         health = "Building memory..."
 
+                    energy = att_stats.get('total_energy', 0)
+                    budget = att_stats.get('energy_budget', 40)
+
                     print(
                         f"[Summary @ {t}] Health: {health} | "
                         f"Mem: {mem_stats.get('size', 0)} | "
                         f"AvgInterest: {mem_stats.get('avg_interestingness', 0):.2f} | "
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
-                        f"(str={att_stats.get('avg_strength', 0):.2f}, "
+                        f"(E={energy:.1f}/{budget:.0f}, "
+                        f"str={att_stats.get('avg_strength', 0):.2f}, "
                         f"r={att_stats.get('avg_radius', 0):.2f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f}",
                         end=""
