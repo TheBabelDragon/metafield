@@ -3,10 +3,7 @@
 memory.py
 
 Episodic memory with interestingness and prioritization.
-
-No rigid hard cap. Soft expandable capacity grows with experience;
-priority-based eviction only applies under soft pressure.
-Designed for long continuous runs.
+Supports external drive-force scaling of exploration (e.g. from Aurora feed).
 """
 
 from typing import List, Dict, Any
@@ -57,10 +54,7 @@ class EpisodicExperience:
 class EpisodicMemory:
     """
     Prioritized episodic buffer with soft expandable capacity.
-
-    - soft_capacity starts modest and grows with total experiences seen
-    - eviction only when above soft_capacity (lowest priority first)
-    - absolute_safety_limit is only a last-resort guard against runaway RAM
+    exploration_scale can be driven by Aurora environment feed.
     """
 
     def __init__(self,
@@ -83,12 +77,15 @@ class EpisodicMemory:
         self.base_exploration_rate = base_exploration_rate
         self.min_exploration = min_exploration
         self.max_exploration = max_exploration
+        self.exploration_scale = 1.0  # set by Aurora drive force
+
+    def set_drive_scale(self, exploration_scale: float = 1.0):
+        self.exploration_scale = max(0.4, min(1.8, float(exploration_scale)))
 
     def add(self, exp: EpisodicExperience) -> None:
         self.buffer.append(exp)
         self.total_added += 1
 
-        # Soft capacity expands with experience (long-run friendly)
         if (self.total_added % self.growth_every == 0 and
                 self.soft_capacity < self.soft_capacity_max):
             self.soft_capacity = min(
@@ -96,13 +93,11 @@ class EpisodicMemory:
                 self.soft_capacity + self.growth_step
             )
 
-        # Priority eviction only under soft pressure
         if len(self.buffer) > self.soft_capacity:
             overflow = len(self.buffer) - self.soft_capacity
             self.buffer.sort(key=lambda e: e.priority)
             self.buffer = self.buffer[overflow:]
 
-        # Absolute safety only (should rarely hit)
         if len(self.buffer) > self.absolute_safety_limit:
             overflow = len(self.buffer) - self.absolute_safety_limit
             self.buffer.sort(key=lambda e: e.priority)
@@ -110,9 +105,10 @@ class EpisodicMemory:
 
     def _current_exploration_rate(self) -> float:
         if not self.buffer:
-            return self.base_exploration_rate
+            return self.base_exploration_rate * self.exploration_scale
         avg_interest = sum(e.interestingness for e in self.buffer) / len(self.buffer)
         rate = self.base_exploration_rate * (1.5 / (1.0 + avg_interest))
+        rate *= self.exploration_scale
         return max(self.min_exploration, min(self.max_exploration, rate))
 
     def sample(self, n: int = 24) -> List[EpisodicExperience]:
@@ -147,7 +143,8 @@ class EpisodicMemory:
                 "soft_capacity_max": self.soft_capacity_max,
                 "avg_priority": 0.0,
                 "avg_interestingness": 0.0,
-                "exploration_rate": self.base_exploration_rate,
+                "exploration_rate": self.base_exploration_rate * self.exploration_scale,
+                "exploration_scale": self.exploration_scale,
                 "total_added": self.total_added,
             }
         priorities = [e.priority for e in self.buffer]
@@ -159,6 +156,7 @@ class EpisodicMemory:
             "avg_priority": sum(priorities) / len(priorities),
             "avg_interestingness": sum(interestingnesses) / len(interestingnesses),
             "exploration_rate": self._current_exploration_rate(),
+            "exploration_scale": self.exploration_scale,
             "total_added": self.total_added,
         }
 

@@ -3,10 +3,7 @@
 attractors.py
 
 Force-based Attractor Dynamics with Homeostasis and Adaptive Basins.
-
-No rigid hard attractor count ceiling. Energy budget is the primary
-regulator; max_attractors is only a soft preference under energy pressure.
-Designed for long continuous runs.
+Supports external energy_scale drive force (e.g. from Aurora feed).
 """
 
 from __future__ import annotations
@@ -64,14 +61,6 @@ class Attractor:
 
 
 class AttractorDynamics:
-    """
-    Force-based landscape regulated primarily by energy budget.
-
-    soft_attractor_target is a preference, not a hard wall.
-    New attractors can still nucleate; homeostasis + merge + min_strength
-    keep the landscape healthy over long runs.
-    """
-
     def __init__(self,
                  soft_attractor_target: int = 80,
                  energy_budget: float = 80.0,
@@ -82,12 +71,19 @@ class AttractorDynamics:
                  min_strength: float = 0.15):
         self.attractors: List[Attractor] = []
         self.soft_attractor_target = soft_attractor_target
+        self.base_energy_budget = energy_budget
         self.energy_budget = energy_budget
+        self.energy_scale = 1.0
         self.merge_tolerance = merge_tolerance
         self.attraction_scale = attraction_scale
         self.repulsion_scale = repulsion_scale
         self.step_size = step_size
         self.min_strength = min_strength
+
+    def set_drive_scale(self, energy_scale: float = 1.0):
+        """Aurora drive force adjusts effective energy budget."""
+        self.energy_scale = max(0.5, min(1.5, float(energy_scale)))
+        self.energy_budget = self.base_energy_budget * self.energy_scale
 
     def __len__(self) -> int:
         return len(self.attractors)
@@ -111,8 +107,6 @@ class AttractorDynamics:
             nearest.reinforce(amount=0.4 + 0.3 * interestingness, new_position=latent)
         else:
             strength = 1.0 + 0.5 * interestingness
-            # Prefer nucleation; only replace weakest if far over soft target
-            # and energy is also under pressure
             over_count = len(self.attractors) >= self.soft_attractor_target
             over_energy = self.total_energy() > self.energy_budget * 0.95
 
@@ -232,6 +226,7 @@ class AttractorDynamics:
                 "avg_consistency": 0.0,
                 "total_energy": 0.0,
                 "energy_budget": self.energy_budget,
+                "energy_scale": self.energy_scale,
             }
         strengths = [a.strength for a in self.attractors]
         radii = [a.radius for a in self.attractors]
@@ -247,4 +242,5 @@ class AttractorDynamics:
             "avg_consistency": sum(consistencies) / len(consistencies),
             "total_energy": sum(strengths),
             "energy_budget": self.energy_budget,
+            "energy_scale": self.energy_scale,
         }
