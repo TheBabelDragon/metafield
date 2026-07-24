@@ -1,103 +1,55 @@
 # MetaField + Aurora Integration Plan
 
-**Goal**: Turn MetaField into a first-class citizen inside the Aurora swarm so it can benefit from distributed coordination, community compute, and Aurora’s modular architecture — while keeping MetaField’s physics + intelligence core intact.
-
-This is a phased, pragmatic plan.
+**Updated for v1.46**
 
 ---
 
-## Guiding Principles
+## Current status (v1.46)
 
-- Start small and concrete. Avoid big rewrites early.
-- Make MetaField components easy to plug into Aurora’s existing `mods/` + hook system.
-- Keep the single-machine experience excellent as the foundation.
-- Let Aurora handle distribution, scheduling, and node management.
-- Allow MetaField’s memory/prediction/curvature signals to eventually influence Aurora’s decisions.
+### Done
+- Soft expandable episodic memory + force-based attractors + homeostasis + adaptive basins
+- Continuous singleton lock (duplicate continuous prohibited)
+- Control surface fail-closed (`METAFIELD_CONTROL_TOKEN`)
+- Local stats export (`--export-stats`) — file only, no Redis publish
+- **Aurora environment feed (read-only)**
+  - Start prompt from live sensing context
+  - Drive force → exploration scale, energy budget scale, interest gate bias
+  - Degrades gracefully if Redis unavailable
 
----
-
-## Phase 1: Preparation (Current Focus)
-
-### 1.1 Make MetaField more modular (Internal)
-
-**Goal**: Make it easy to extract and reuse core pieces.
-
-- Separate concerns clearly:
-  - `simulation/` — HMC engine + lattice operations
-  - `memory/` — EpisodicMemory + prioritization
-  - `prediction/` — LatentPredictor
-  - `geometry/` — LearnedInformationGeometry
-  - `core/` — Shared utilities and config
-- Add clear interfaces / abstract base classes where helpful.
-- Improve continuous mode so it’s observable and resumable.
-
-### 1.2 Improve diagnostics and observability
-
-- Better structured logging during long runs.
-- Expose key signals (memory size, prediction loss, average priority, curvature) in a machine-readable way.
-- These signals will later be useful for Aurora’s sensing layer.
-
-### 1.3 Stabilize single-machine continuous experience
-
-- Make `--continuous` the primary development mode.
-- Clean shutdown + state saving (future).
-- Periodic summaries that are useful for both humans and future schedulers.
+### Not yet (still gated)
+- Redis *publish* from MetaField into Aurora channels
+- Overlord remote commands (requires control token + explicit design)
+- Scheduler task wrapper for HMC continuous runs
 
 ---
 
-## Phase 2: First Integration Points
+## Aurora feed → MetaField drive force
 
-### 2.1 Run MetaField as an Aurora Worker / Mod
+| Aurora environment | MetaField effect |
+|--------------------|------------------|
+| Empty / scale_up | exploration ↑, energy budget ↑ |
+| High occupancy / scale_down | exploration ↓, energy budget ↓ |
+| Anomaly / security | interest gate lowered, exploration moderated |
+| Unavailable | neutral (local-only dynamics) |
 
-**Goal**: Make the current HMC + memory + prediction loop schedulable by Aurora.
+Enable with:
 
-Possible approaches:
+```bash
+export REDIS_URL=redis://127.0.0.1:6379/0   # optional; auto-detects
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous --aurora-feed --export-stats
+```
 
-- Wrap the main training/simulation loop as a simple Aurora mod.
-- Use Aurora’s existing worker infrastructure instead of manual `--continuous`.
-- Start with single-node execution inside Aurora, then expand to multi-node.
-
-**First concrete deliverable**:
-- A minimal wrapper that lets Aurora start a MetaField continuous run as a task.
-- Basic reporting back of memory/prediction stats to Aurora’s sensing layer.
-
-### 2.2 Map MetaField concepts to Aurora concepts
-
-| MetaField Component       | Aurora Equivalent          | Integration Type      | Priority |
-|---------------------------|----------------------------|-----------------------|----------|
-| EpisodicMemory            | Mod state / memory store   | Mod internal state    | High     |
-| LatentPredictor           | Prediction hook            | Mod                   | Medium   |
-| LearnedInformationGeometry| Sensing + feature extraction | Sensing mod        | Medium   |
-| HMC trajectory loop       | Scheduled task / workload  | Worker task           | High     |
-| Curvature / interesting configs | Scheduling signal     | Influencer            | Medium   |
+Without Redis, MetaField still runs; feed reports unavailable and drive force stays neutral.
 
 ---
 
-## Phase 3: Deeper Integration
+## Next integration steps (when security allows)
 
-- Allow Aurora’s scheduler to use MetaField signals (e.g. high curvature regions → prioritize those configurations).
-- Make memory replay and prediction part of Aurora’s sensing/mod system.
-- Explore bidirectional influence (Aurora scheduling decisions affect MetaField memory, and vice versa).
-
----
-
-## Open Questions
-
-- Should MetaField become a set of Aurora mods, or should it remain a mostly separate codebase that Aurora schedules?
-- How much of Aurora’s existing Bitcoin-mining-oriented design needs to be generalized?
-- What is the minimal viable integration that already provides value?
+1. Authenticated publish of MetaField stats onto `aurora:sensing:*` (token required)
+2. Aurora mod registration for live dashboard
+3. Scheduler influence (prefer nodes when MetaField interest is high)
+4. Overlord start/stop of continuous runs under singleton lock
 
 ---
 
-## Current Status
-
-- `HYBRID_VISION.md` created
-- `INTEGRATION_PLAN.md` created
-- MetaField has working episodic memory + prediction in continuous mode
-- Distributed multi-machine still needs work (Gloo issues)
-
-Next: Focus on modularity + continuous mode improvements while we design the first Aurora integration points.
-
----
-
-*This is a living document. Feedback and adjustments welcome.*
+*Living document.*
