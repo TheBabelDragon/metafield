@@ -1,10 +1,10 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.47**
+**Updated for v1.48**
 
 ---
 
-## Current status (v1.47)
+## Current status (v1.48)
 
 ### Done
 - Soft expandable episodic memory + force-based attractors + homeostasis + adaptive basins
@@ -15,11 +15,16 @@
   - Start prompt from live sensing context
   - Drive force → exploration scale, energy budget scale, interest gate bias
   - Degrades gracefully if Redis unavailable
-- **Richer local sensing surface (schema v2)**
+- **Richer local sensing surface (schema v3)**
   - HMC acceptance rate + recent |ΔH|
-  - Geometry reconstruction error
+  - Geometry reconstruction error + train loss
+  - Occasional scalar curvature probe
   - Clear health string derived from multiple signals
-  - Versioned schema + improved `metafield_sensing` mod (0.2.0)
+  - Versioned schema + improved `metafield_sensing` mod (0.2.1)
+- **Attractor → geometry deformation loop is now active**
+  - High-interestingness experiences reinforce attractors
+  - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
+  - This is the first concrete step from "memory as stored states" toward "memory as deformation of the manifold"
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels

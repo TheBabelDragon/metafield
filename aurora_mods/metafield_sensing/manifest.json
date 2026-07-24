@@ -1,7 +1,7 @@
 {
   "name": "metafield_sensing",
-  "version": "0.2.0",
-  "description": "Exposes MetaField memory, prediction, geometry, HMC health and Aurora drive signals into Aurora's sensing layer (file-based, read-only).",
+  "version": "0.2.1",
+  "description": "Exposes MetaField memory, prediction, geometry (incl. attractor-driven deformation + curvature), HMC health and Aurora drive signals into Aurora's sensing layer (file-based, read-only).",
   "author": "MetaField Team",
   "entrypoint": "entrypoint.py",
   "hooks": ["on_sensing_tick", "on_node_status"],

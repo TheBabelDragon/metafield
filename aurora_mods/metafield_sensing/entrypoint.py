@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-metafield_sensing / entrypoint.py  (v0.2.0)
+metafield_sensing / entrypoint.py  (v0.2.1)
 
 MetaField sensing integration mod for Aurora Swarm.
 
 Reads local stats export only (file-based). No Redis / network publish
 until control token + overlord security overlay are fully in place.
 
-Schema v2 (from MetaField >= 1.47) includes richer HMC + geometry signals.
+Schema v3 (from MetaField >= 1.48) includes geometry train loss + curvature.
 """
 
 from typing import Dict, Any, Optional
@@ -59,7 +59,7 @@ def get_metafield_stats() -> Dict[str, Any]:
             "live": False,
         }
 
-    # Normalize for both schema v1 (old) and v2 (current)
+    # Normalize for schema v1–v3
     schema = data.get("schema_version", 1)
     return {
         "schema_version": schema,
@@ -95,6 +95,7 @@ def on_sensing_tick(context: Any = None) -> None:
     att = stats.get("attractors", {})
     hmc = stats.get("hmc", {})
     pred = stats.get("prediction", {})
+    geom = stats.get("geometry", {})
     health = stats.get("health", "?")
     traj = stats.get("traj", "?")
 
@@ -110,6 +111,11 @@ def on_sensing_tick(context: Any = None) -> None:
         parts.append(f"accept={hmc.get('acceptance_rate', 0):.2f}")
         if hmc.get("recent_abs_dh") is not None:
             parts.append(f"|dH|={hmc['recent_abs_dh']:.2f}")
+
+    if geom.get("train_loss") is not None:
+        parts.append(f"geom={geom['train_loss']:.2e}")
+    if geom.get("scalar_curvature") is not None:
+        parts.append(f"R={geom['scalar_curvature']:.2e}")
 
     if pred.get("recent_loss") is not None:
         parts.append(f"pred={pred['recent_loss']:.2e}")
@@ -129,7 +135,7 @@ def register() -> None:
     print("[metafield_sensing] Registering hooks (local-file mode, no Redis)...")
     print("[metafield_sensing] Control surface: "
           + ("enabled" if control_enabled() else "disabled"))
-    print("[metafield_sensing] Ready (read-only local stats, schema v2)")
+    print("[metafield_sensing] Ready (read-only local stats, schema v3)")
 
 
 if __name__ == "__main__":

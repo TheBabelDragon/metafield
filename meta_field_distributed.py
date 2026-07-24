@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.47
+meta_field_distributed.py v1.48
 
 Aurora environment feed (read-only): start prompt + live drive force.
 Security overlay + continuous singleton lock retained.
 Richer local stats export for sensing (file-only).
+Attractor → geometry deformation loop now active.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from meta_field_sim_torch import (
     gamma5,
 )
 
-VERSION = "1.47"
+VERSION = "1.48"
 
 
 def get_real_lan_ip() -> str:
@@ -73,7 +74,7 @@ def print_banner(rank, world_size, role, diagnostic=False):
     print("=" * 72)
     print(f"   Role: {role.upper()} | Rank {rank}/{world_size}")
     if diagnostic:
-        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + AURORA FEED]")
+        print("   [DIAGNOSTIC + MEMORY + ATTRACTORS + GEOMETRY DEFORMATION + AURORA FEED]")
     ctrl = "enabled" if control_enabled() else "disabled (set METAFIELD_CONTROL_TOKEN to enable)"
     print(f"   Control surface: {ctrl}")
     print()
@@ -348,12 +349,14 @@ def apply_drive(feed: Optional[AuroraFeed], memory, attractor_dyn):
     return drive
 
 
-def _compute_health(mem_stats, att_stats, recent_pred_loss, acceptance_rate, recent_abs_dh):
+def _compute_health(mem_stats, att_stats, recent_pred_loss, acceptance_rate, recent_abs_dh, geometry_loss):
     """Produce a compact health string from multiple signals."""
     if mem_stats.get("size", 0) < 20:
         return "Building memory..."
     if recent_pred_loss is not None and recent_pred_loss > 0.15:
         return "Warning (high pred loss)"
+    if geometry_loss is not None and geometry_loss > 0.25:
+        return "Warning (geometry lagging)"
     if acceptance_rate < 0.4 and recent_abs_dh is not None and recent_abs_dh > 2.0:
         return "Warning (HMC struggling)"
     if att_stats.get("num_attractors", 0) == 0 and mem_stats.get("size", 0) > 40:
@@ -405,6 +408,8 @@ def main():
     predictor = LatentPredictor().to(torch.float64) if (args.diagnostic and rank == 0) else None
     predictor_optimizer = torch.optim.Adam(predictor.parameters(), lr=5e-4) if predictor is not None else None
     geometry = None
+    last_geometry_loss = None
+    last_curvature = None
 
     drive = apply_drive(aurora, memory, attractor_dyn)
     if drive is not None:
@@ -452,13 +457,17 @@ def main():
                 exp.update_priority(reconstruction_error=recon_error)
                 memory.add(exp)
 
+                # --- Core intelligence loop (every 25 trajectories) ---
                 if predictor is not None and len(memory.buffer) > 8 and t % 25 == 0:
                     batch = memory.sample(24)
+
+                    # Reinforce attractors from high-interestingness experiences
                     for e in batch:
                         if e.interestingness > interest_gate:
                             attractor_dyn.reinforce_from_latent(e.latent, interestingness=e.interestingness)
                     attractor_dyn.step()
 
+                    # Train predictor
                     recent = hmc.field_samples[-min(24, len(hmc.field_samples)):]
                     x_batch = torch.stack(recent).to(torch.float64)
                     z_batch = geometry.encode(x_batch)
@@ -473,6 +482,26 @@ def main():
                     predictor_optimizer.step()
                     for e in batch:
                         e.update_priority(prediction_error=float(pred_loss.item()), reconstruction_error=recon_error)
+
+                    # === NEW: close the attractor → geometry deformation loop ===
+                    # Train the autoencoder on recent samples, guided by current attractors.
+                    # This is the key step that turns memory into manifold deformation.
+                    landscape = attractor_dyn.get_landscape()
+                    if len(recent) >= 4:
+                        last_geometry_loss = geometry.train_on_batch(
+                            recent,
+                            epochs=12,
+                            attractors=landscape if landscape else None,
+                        )
+
+                    # Occasional curvature probe (expensive — only every few cycles)
+                    if t % 100 == 0 and last_geometry_loss is not None:
+                        try:
+                            with torch.no_grad():
+                                z_probe = geometry.encode(hmc.field_samples[-1])
+                            last_curvature = geometry.scalar_curvature(z_probe)
+                        except Exception:
+                            last_curvature = None
 
                 if args.continuous and t > 0 and t % summary_interval == 0:
                     mem_stats = memory.get_stats()
@@ -495,7 +524,7 @@ def main():
 
                     health = _compute_health(
                         mem_stats, att_stats, recent_pred_loss,
-                        acceptance_rate, recent_abs_dh
+                        acceptance_rate, recent_abs_dh, last_geometry_loss
                     )
 
                     aurora_mode = drive.mode if drive is not None else "off"
@@ -506,18 +535,20 @@ def main():
                         f"Attractors: {att_stats.get('num_attractors', 0)} "
                         f"(E={att_stats.get('total_energy', 0):.1f}/{att_stats.get('energy_budget', 80):.0f}) | "
                         f"Explore: {mem_stats.get('exploration_rate', 0):.2f} | "
-                        f"Accept: {acceptance_rate:.2f} | "
-                        f"Aurora: {aurora_mode}",
+                        f"Accept: {acceptance_rate:.2f}",
                         end="",
                     )
+                    if last_geometry_loss is not None:
+                        print(f" | GeomLoss: {last_geometry_loss:.3e}", end="")
+                    if last_curvature is not None:
+                        print(f" | R={last_curvature:.3e}", end="")
                     if recent_pred_loss is not None:
-                        print(f" | PredLoss: {recent_pred_loss:.2e}")
-                    else:
-                        print()
+                        print(f" | PredLoss: {recent_pred_loss:.2e}", end="")
+                    print(f" | Aurora: {aurora_mode}")
 
                     if args.export_stats:
                         write_local_stats({
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "version": VERSION,
                             "traj": t,
                             "health": health,
@@ -530,7 +561,11 @@ def main():
                             "memory": mem_stats,
                             "attractors": att_stats,
                             "prediction": {"recent_loss": recent_pred_loss},
-                            "geometry": {"recon_error": recon_error},
+                            "geometry": {
+                                "recon_error": recon_error,
+                                "train_loss": last_geometry_loss,
+                                "scalar_curvature": last_curvature,
+                            },
                             "aurora": aurora.get_stats() if aurora else {},
                             "control_enabled": control_enabled(),
                         })
