@@ -1,6 +1,6 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.50**
+**Updated for v1.50 + Physical Field Substrate**
 
 ---
 
@@ -31,11 +31,15 @@
   - High-interestingness experiences reinforce attractors
   - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
   - Attractor influence weight = 0.4
+- **Physical Field Substrate abstraction documented** (`PHYSICAL_FIELD_SUBSTRATE.md`)
+  - MetaField remains the intelligence layer; lattice / optical / WiFi / ultrasonic are interchangeable bodies
+  - Higher-level observation schema preferred over raw sensor values
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels
 - Overlord remote commands (requires control token + explicit design)
 - Scheduler task wrapper for HMC continuous runs
+- Optical body Phase 0 (passive observability) implementation
 
 ---
 
@@ -86,6 +90,8 @@ python meta_field_distributed.py --world-size 1 --diagnostic --continuous --expo
 
 Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. On clean exit the same file is updated to `health="stopped"`.
 
+Future bodies (optical, etc.) should publish into the same higher-level observation schema so the sensing surface remains body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md`.
+
 ---
 
 ## Next integration steps (when security allows)
@@ -94,6 +100,7 @@ Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. On cl
 2. Aurora mod registration for live dashboard
 3. Scheduler influence (prefer nodes when MetaField interest is high)
 4. Overlord start/stop of continuous runs under singleton lock
+5. Optical body Phase 0: passive observability (reliable excitation → observation logging + replay)
 
 ---
 
