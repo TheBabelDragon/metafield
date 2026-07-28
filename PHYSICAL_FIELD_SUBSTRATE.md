@@ -92,6 +92,21 @@ The “field” that MetaField models is therefore not physical coordinates alon
 
 ---
 
+## Memory layers
+
+Observation is not enough. The body needs memory of experience.
+
+Three distinct layers (see `MEMORY_ARCHITECTURE.md` for the full design):
+
+| Layer | Owner | Purpose |
+|-------|--------|--------|
+| Fast working memory (RAM/PSRAM) | ESP32-S3 | current laser state, detector frame, temporary geometry |
+| Persistent calibration (FRAM) | optical-body-s3 | “Who am I?” — identity + expected signatures |
+| Field / episodic memory | MetaField | “I remember what this response means.” |
+| Experience archive (MicroSD) | optical-body-s3 | long-term JSONL experiment log |
+
+---
+
 ## Optical Structure as Physical Measurement Substrate
 
 The relationship between the optical structure and MetaField is where the hardware becomes interesting.  
@@ -195,7 +210,7 @@ M_ij = response of detector j to emitter i
 
 This replaces hand-calculating every reflection and refraction.  
 The dodecahedron is no longer a container; it is a **learned transformation operator**.  
-That matrix is the optical fingerprint of the structure.
+That matrix is the optical fingerprint of the structure and lives in FRAM.
 
 ### 2. Adaptive probing
 
@@ -252,7 +267,8 @@ Firmware side (ESP32-S3 physical node):
 - New repo: [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3)
 - Real BPW34 → ADS1115 path preferred from day one
 - Emits the same conceptual `FieldObservation` packets
-- Self-map on boot creates the first geometry fingerprint
+- Self-map on boot creates the first geometry fingerprint (intended for FRAM)
+- FRAM + MicroSD memory layers scaffolded
 
 See issue #1.
 
@@ -305,7 +321,9 @@ That gives MetaField something it normally lacks: a **persistent, physically gro
 
 See also:
 
+- `MEMORY_ARCHITECTURE.md` — three-tier memory (RAM / FRAM / Field Memory / SD archive)
 - `schemas/field_observation.py` — formal `FieldObservation` / `FieldRegion` types + helpers
+- `schemas/field_memory.py` — `FieldMemoryEntry` for episodic field experience
 - `optical_body_stub.py` — Phase-0 synthetic passive loop + replayable JSONL log
 - [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) — ESP32-S3 firmware (real BPW34 path preferred)
 - `HYBRID_VISION.md` — overall MetaField + Aurora architecture
