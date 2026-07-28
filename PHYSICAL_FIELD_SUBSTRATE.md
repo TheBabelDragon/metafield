@@ -240,14 +240,21 @@ It must reliably answer:
 
 No learning yet. Stable perception before curiosity.
 
-A pure-software stub already exists so the rest of the stack can be developed in parallel with hardware:
+Software side (already available):
 
 ```bash
 python optical_body_stub.py --clear-log --excitations 12
 python optical_body_stub.py --replay-only
 ```
 
-It emits valid `FieldObservation` packets and writes a deterministic, replayable JSONL log. See issue #1.
+Firmware side (ESP32-S3 physical node):
+
+- New repo: [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3)
+- Real BPW34 → ADS1115 path preferred from day one
+- Emits the same conceptual `FieldObservation` packets
+- Self-map on boot creates the first geometry fingerprint
+
+See issue #1.
 
 **Phase 1 — Self-calibration / Optical identity**  
 Learn the transfer map `M_ij`.  
@@ -300,6 +307,7 @@ See also:
 
 - `schemas/field_observation.py` — formal `FieldObservation` / `FieldRegion` types + helpers
 - `optical_body_stub.py` — Phase-0 synthetic passive loop + replayable JSONL log
+- [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) — ESP32-S3 firmware (real BPW34 path preferred)
 - `HYBRID_VISION.md` — overall MetaField + Aurora architecture
 - `INTEGRATION_PLAN.md` — current integration status and next gated steps
 - `aurora_mods/metafield_sensing/` — the sensing surface that future bodies will feed
