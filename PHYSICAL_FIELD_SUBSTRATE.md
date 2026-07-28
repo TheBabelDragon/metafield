@@ -240,6 +240,15 @@ It must reliably answer:
 
 No learning yet. Stable perception before curiosity.
 
+A pure-software stub already exists so the rest of the stack can be developed in parallel with hardware:
+
+```bash
+python optical_body_stub.py --clear-log --excitations 12
+python optical_body_stub.py --replay-only
+```
+
+It emits valid `FieldObservation` packets and writes a deterministic, replayable JSONL log. See issue #1.
+
 **Phase 1 — Self-calibration / Optical identity**  
 Learn the transfer map `M_ij`.  
 “What does my own body look like?”
@@ -290,9 +299,11 @@ That gives MetaField something it normally lacks: a **persistent, physically gro
 See also:
 
 - `schemas/field_observation.py` — formal `FieldObservation` / `FieldRegion` types + helpers
+- `optical_body_stub.py` — Phase-0 synthetic passive loop + replayable JSONL log
 - `HYBRID_VISION.md` — overall MetaField + Aurora architecture
 - `INTEGRATION_PLAN.md` — current integration status and next gated steps
 - `aurora_mods/metafield_sensing/` — the sensing surface that future bodies will feed
+- Issue #1 — Optical body Phase 0 tracking
 
 ---
 
