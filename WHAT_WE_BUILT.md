@@ -34,14 +34,26 @@ That is identity. Not a blink demo.
 
 ---
 
+## Closing the circle (shaped light)
+
+```
+observe → FieldMemoryStore → active_probe (curiosity)
+                ↓
+         EXCITE <id> on Serial
+                ↓
+         body.exciteOnce → new observation
+```
+
+The body can be *told* which light to shape. MetaField can prefer sources with high anomaly / low confidence. Not full Phase 3 — the hinge is there.
+
+---
+
 ## Two views of the same light
 
 ```
 BPW34 → LM393   → what changed?     (reflex)
 BPW34 → ADS1115 → how much?         (perception)
 ```
-
-Fast events without throwing away the field that learning needs.
 
 ---
 
@@ -66,11 +78,11 @@ When that passes on hardware, MetaField has a persistent physical environment to
 
 ## Repos
 
-- **This one** — schemas, FieldMemoryStore, stubs, architecture docs  
-- **[optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3)** — ESP32-S3 firmware (calibration, identity, dual streams)
+- **This one** — schemas, FieldMemoryStore, `active_probe.py`, architecture docs  
+- **[optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3)** — ESP32-S3 firmware (`EXCITE` / `MAP` / `VERIFY`)
 
 BOM is frozen. Next work is measurement.
 
 ---
 
-*We didn’t make the AI smarter first. We gave it a body that can recognize itself in the dark.*
+*We didn’t make the AI smarter first. We gave it a body that can recognize itself in the dark — and a way to choose the next light.*
