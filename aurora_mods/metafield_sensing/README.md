@@ -2,17 +2,17 @@
 
 MetaField sensing integration mod for Aurora Swarm.
 
-**Current version: 0.2.0**
+**Current version: 0.2.3**
 
 ## Purpose
 
 Expose useful internal signals from MetaField into Aurora's sensing and monitoring systems.
 
-Signals (schema v2):
+Signals (schema v4):
 - Episodic memory statistics (size, priority, exploration rate)
 - Attractor landscape (count, total energy, budget, consistency)
 - Prediction loss
-- Geometry / reconstruction error
+- Geometry / reconstruction error + Fisher diagnostics + scalar curvature
 - HMC health (acceptance rate, recent |ΔH|)
 - Aurora drive force mode (when feed is active)
 - Overall health string
@@ -31,6 +31,11 @@ This is the lowest-risk, highest-value first integration:
 
 Still strictly **read-only / file-based**. No Redis publish.
 
+## Multi-body direction
+
+Future physical bodies (optical dodecahedron, WiFi CSI, ultrasonic, …) will publish through the shared `FieldObservation` schema defined in `schemas/field_observation.py`.  
+This mod will eventually consume that common interface so the sensing surface stays body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md`.
+
 ## Usage
 
 On the MetaField side (continuous run with export):
@@ -47,6 +52,7 @@ The mod reads from the path defined by `METAFIELD_RUNTIME_DIR` (default `/tmp/me
 2. **v0.2** (current) — Real file-based connection + richer schema
 3. **v0.3** — Curvature and "interesting configuration" signals
 4. **v0.4+** — Authenticated publish + task scheduling influence (requires control token)
+5. **Later** — Consume `FieldObservation` packets from any body (optical Phase 0+, etc.)
 
 ## Integration Notes
 
