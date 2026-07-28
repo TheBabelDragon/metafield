@@ -33,7 +33,7 @@ class FieldMemoryStore:
     so high-anomaly / low-confidence experiences are kept and replayed.
     """
 
-    def __init(
+    def __init__(
         self,
         soft_capacity: int = 1024,
         soft_capacity_max: int = 16384,
