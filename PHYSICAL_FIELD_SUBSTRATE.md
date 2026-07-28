@@ -57,10 +57,17 @@ Avoid exposing low-level values such as:
 
 directly into MetaField.
 
-The optical node (and every future body) should publish a **higher-level observation schema**:
+The optical node (and every future body) should publish a **higher-level observation schema**.
+
+**Formal definition lives in** `schemas/field_observation.py` (`FieldObservation` + `FieldRegion`).
+
+Example payload:
 
 ```json
 {
+  "schema_version": 1,
+  "body_id": "optical-dodeca-01",
+  "body_type": "optical",
   "excitation_id": 142,
   "field_regions": [
     {
@@ -72,7 +79,9 @@ The optical node (and every future body) should publish a **higher-level observa
     }
   ],
   "geometry_state": "calibrated",
-  "timestamp": "..."
+  "timestamp": "2026-07-28T04:00:00+00:00",
+  "modality": {},
+  "health": "ok"
 }
 ```
 
@@ -276,10 +285,11 @@ That gives MetaField something it normally lacks: a **persistent, physically gro
 
 - The current lattice QCD path remains a first-class body (simulation body).
 - The existing `metafield_sensing` mod, stats schema, Aurora feed, and episodic memory already provide the scaffolding needed for any new body.
-- New bodies only need to speak the higher-level observation schema; the rest of MetaField stays unchanged.
+- New bodies only need to speak the higher-level observation schema (`schemas/field_observation.py`); the rest of MetaField stays unchanged.
 
 See also:
 
+- `schemas/field_observation.py` — formal `FieldObservation` / `FieldRegion` types + helpers
 - `HYBRID_VISION.md` — overall MetaField + Aurora architecture
 - `INTEGRATION_PLAN.md` — current integration status and next gated steps
 - `aurora_mods/metafield_sensing/` — the sensing surface that future bodies will feed
