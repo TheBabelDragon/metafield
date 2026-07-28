@@ -11,6 +11,7 @@ That requires three distinct memory layers. They are not interchangeable.
 │  “Yesterday, when this pattern occurred, the field looked   │
 │   like this.”                                               │
 │  Attractors · confidence · replay · meaning                 │
+│  Implementation: FieldMemoryStore + FieldMemoryEntry         │
 └──────────────────────────▲──────────────────────────────────┘
                            │ FieldObservation packets
 ┌──────────────────────────┴──────────────────────────────────┐
@@ -87,15 +88,21 @@ FRAM is ideal: non-volatile, high endurance, fast enough for occasional writes a
 
 This is **not** normal RAM. It is episodic memory over field states.
 
+**Implementation (Phase 0):**
+
+- `schemas/field_memory.py` → `FieldMemoryEntry`
+- `field_memory_store.py` → prioritized buffer (anomaly / low-confidence preferred)
+- Parallel to lattice `EpisodicMemory` in `memory.py` (does not replace it)
+
 Conceptual entry:
 
 ```python
 FieldMemoryEntry:
     location:          # optional spatial / region key
-        x, y, z        # or region_id
     expected_response:
     observed_response:
     confidence:
+    anomaly:
     timestamp:
     attractor_id:      # link into the existing attractor dynamics
     excitation_id:     # link back to the body packet
@@ -106,8 +113,11 @@ Example meaning:
 
 > “Yesterday, when this laser pattern occurred, the field looked like this.”
 
-MetaField already has episodic memory + prioritized replay + attractors.  
-FieldMemoryEntry is the natural extension that lets optical (and future) bodies feed the same machinery.
+Smoke test (no hardware):
+
+```bash
+python examples/optical_memory_smoke.py
+```
 
 The body only emits `FieldObservation` packets.  
 MetaField decides what is worth remembering and how it links to attractors.
@@ -184,9 +194,13 @@ That is Phase 3+ territory. Do not build it yet.
 
 ## Relation to existing work
 
-- `schemas/field_observation.py` — the packet the body emits into Field Memory
-- `optical_body_stub.py` / [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) — produces the packets + will own FRAM + SD
-- MetaField `memory.py` / attractors — the place FieldMemoryEntry lands
+- `schemas/field_observation.py` — packet the body emits
+- `schemas/field_memory.py` — `FieldMemoryEntry`
+- `field_memory_store.py` — prioritized episodic store for field bodies
+- `examples/optical_memory_smoke.py` — end-to-end Phase-0 smoke test
+- `optical_body_stub.py` / `optical_serial_consumer.py` — synthetic body + host bridge
+- [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) — ESP32-S3 firmware (FRAM + SD)
+- `memory.py` — lattice episodic memory (parallel path, not replaced)
 - `PHYSICAL_FIELD_SUBSTRATE.md` — overall body abstraction
 
 ---
