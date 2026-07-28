@@ -1,10 +1,10 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.50 + Physical Field Substrate**
+**Updated for v1.50 + Physical Field Substrate + Phase-0 stub**
 
 ---
 
-## Current status (v1.50)
+## Current status (v1.50+)
 
 ### Done
 - Soft expandable episodic memory + force-based attractors + homeostasis + adaptive basins
@@ -21,12 +21,12 @@
   - Start prompt from live sensing context
   - Drive force → exploration scale, energy budget scale, interest gate bias
   - Degrades gracefully if Redis unavailable
-- **Richer local sensing surface (schema v3)**
+- **Richer local sensing surface (schema v3/v4)**
   - HMC acceptance rate + recent |ΔH|
   - Geometry reconstruction error + train loss
   - Occasional scalar curvature probe
   - Clear health string + explicit `live` / `stopped` signals
-  - Versioned schema + improved `metafield_sensing` mod (0.2.2)
+  - Versioned schema + improved `metafield_sensing` mod (0.2.3)
 - **Attractor → geometry deformation loop is active**
   - High-interestingness experiences reinforce attractors
   - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
@@ -34,12 +34,19 @@
 - **Physical Field Substrate abstraction documented** (`PHYSICAL_FIELD_SUBSTRATE.md`)
   - MetaField remains the intelligence layer; lattice / optical / WiFi / ultrasonic are interchangeable bodies
   - Higher-level observation schema preferred over raw sensor values
+  - Formal `FieldObservation` types in `schemas/field_observation.py`
+- **Optical Phase-0 software stub** (`optical_body_stub.py`)
+  - Synthetic passive excitation loop
+  - Emits valid `FieldObservation` packets
+  - Replayable JSONL log
+  - Lets Aurora / MetaField side develop in parallel with real hardware
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels
 - Overlord remote commands (requires control token + explicit design)
 - Scheduler task wrapper for HMC continuous runs
-- Optical body Phase 0 (passive observability) implementation
+- Real optical hardware/firmware path (BPW34 + lasers)
+- Optical body Phase 1 (transfer-matrix self-calibration)
 
 ---
 
@@ -90,7 +97,14 @@ python meta_field_distributed.py --world-size 1 --diagnostic --continuous --expo
 
 Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. On clean exit the same file is updated to `health="stopped"`.
 
-Future bodies (optical, etc.) should publish into the same higher-level observation schema so the sensing surface remains body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md`.
+Future bodies (optical, etc.) should publish into the same higher-level observation schema so the sensing surface remains body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md` and `schemas/field_observation.py`.
+
+Optical Phase-0 stub for parallel development:
+
+```bash
+python optical_body_stub.py --clear-log --excitations 12
+python optical_body_stub.py --replay-only
+```
 
 ---
 
@@ -100,7 +114,8 @@ Future bodies (optical, etc.) should publish into the same higher-level observat
 2. Aurora mod registration for live dashboard
 3. Scheduler influence (prefer nodes when MetaField interest is high)
 4. Overlord start/stop of continuous runs under singleton lock
-5. Optical body Phase 0: passive observability (reliable excitation → observation logging + replay)
+5. Real optical hardware path replacing the synthetic stub (issue #1)
+6. Optical Phase 1 — transfer-matrix self-calibration
 
 ---
 
