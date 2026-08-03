@@ -6,7 +6,7 @@
 
 ## Core Insight
 
-The optical system should **not** become a special-case project inside MetaField.  
+Any physical or simulated system should **not** become a special-case project inside MetaField.  
 It should become **another embodiment of the same abstraction**.
 
 ```
@@ -16,14 +16,26 @@ MetaField Core (physics / inference engine)
         │
 Physical Field Interface
         │
- ┌──────┴──────┬──────────────┬──────────────┐
- │ Optical     │ WiFi CSI     │ Ultrasonic   │ Simulation
- │ body        │ body         │ body         │ (lattice)
- └─────────────┴──────────────┴──────────────┘
+ ┌──────┴──────┬──────────────┬──────────────┬──────────────┐
+ │ Optical     │ WiFi CSI     │ Ultrasonic   │ ZVS / HV     │ Simulation
+ │ body        │ body         │ body         │ resonant     │ (lattice)
+ └─────────────┴──────────────┴──────────────┴──────────────┘
 ```
 
 - **MetaField** stays the physics/inference engine.
-- The optical substrate is simply **another source of states**.
+- Every substrate is simply **another source of states** that publishes `FieldObservation` packets.
+
+---
+
+## Bodies (current)
+
+| Body | Repo | Status | Primary sense / act |
+|------|------|--------|---------------------|
+| Lattice (HMC) | this repo | live | simulated gauge field |
+| Optical | [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3) | Phase 0 software + hardware architecture | laser excitation + BPW34 |
+| Ultrasonic | [echo-grid-ultrasonic-os](https://github.com/TheBabelDragon/echo-grid-ultrasonic-os) | firmware + field kernel | 40 kHz transducers |
+| **ZVS / Resonant HV** | [zvs-node](https://github.com/TheBabelDragon/zvs-node) (private) | architecture captured | isolated ESP32-S3 TWAI/CAN + ZVS power stage + flyback HV |
+| WiFi CSI | [wifi-sensing-system](https://github.com/TheBabelDragon/wifi-sensing-system) | live | CSI spatial intelligence |
 
 ---
 
@@ -42,7 +54,26 @@ ESP32-S3 RAM → FRAM (identity) → MicroSD (archive) → MetaField memory
 
 ---
 
-## Dual detector streams
+## ZVS Node (new)
+
+Isolated high-power resonant body:
+
+- ESP32-S3 + ADM3053 (TWAI/CAN) on the logic side (GND1)
+- Resonant Royer/ZVS power stage + flyback HV output on the bus/HV side (GND2)
+- Hardware E-STOP that cannot be defeated by firmware
+- Telemetry: isolated current (ACS781), voltage (AMC1301), temperatures, E-STOP state, fan
+
+It can act as:
+1. High-efficiency resonant driver for ultrasonic (or other) transducers, or
+2. Experimental high-voltage field generator via the replaceable flyback cartridge.
+
+Because it speaks (or will speak) the same `FieldObservation` contract, MetaField does not need to know whether the “body” is optical photons, acoustic pressure, or resonant power health.
+
+See the private [zvs-node](https://github.com/TheBabelDragon/zvs-node) repo for full isolation rules, placement, and mechanical stack.
+
+---
+
+## Dual detector streams (optical)
 
 ```
 BPW34 → LM393  → "event happened"     (reflex)
@@ -97,16 +128,23 @@ MetaField decides meaning, surprise, prediction.
 - **Phase 2** — predictive model
 - **Phase 3** — active exploration
 
+## Roadmap (ZVS)
+
+- **Phase 0** — architecture + isolation rules + telemetry schema (current)
+- **Phase 1** — ESP32-S3 TWAI firmware emitting health `FieldObservation`s
+- **Phase 2** — closed-loop with MetaField (temperature / current as additional sense modalities)
+
 ---
 
 ## See also
 
 - `MEMORY_ARCHITECTURE.md`
 - `schemas/field_observation.py` / `schemas/field_memory.py`
-- `field_memory_store.py` / `optical_body_stub.py` / `optical_serial_consumer.py`
+- `field_memory_store.py` / `optical_body_stub.py` / `zvs_body_stub.py` / `optical_serial_consumer.py`
 - [optical-body-s3](https://github.com/TheBabelDragon/optical-body-s3)
+- [zvs-node](https://github.com/TheBabelDragon/zvs-node) (private)
 - Issue #1
 
 ---
 
-*Architecture complete. The next thing is measurement.*
+*Architecture complete for optical. ZVS architecture captured. The next thing is measurement.*

@@ -14,7 +14,7 @@ An intelligence that grows up inside a mathematically consistent simulated unive
 
 This is not "MetaField on top of Aurora" or "Aurora with some MetaField mods". It is a true hybrid where both systems evolve together.
 
-**Important generalization (2026-07):** MetaField is no longer tied exclusively to the simulated lattice. The lattice is one *body*. Optical, ultrasonic, WiFi-CSI, and future physical substrates are additional bodies that feed the same intelligence layer. See `PHYSICAL_FIELD_SUBSTRATE.md`.
+**Important generalization (2026-07 / 2026-08):** MetaField is no longer tied exclusively to the simulated lattice. The lattice is one *body*. Optical, ultrasonic, WiFi-CSI, **ZVS resonant/HV**, and future physical substrates are additional bodies that feed the same intelligence layer. See `PHYSICAL_FIELD_SUBSTRATE.md`.
 
 ---
 
@@ -28,7 +28,7 @@ This is not "MetaField on top of Aurora" or "Aurora with some MetaField mods". I
 │                        Aurora Swarm Layer                     │
 │  • Node discovery & coordination                              │
 │  • Scheduler + Overlord                                       │
-│  • Comms layer                                                │
+│  • Comms layer (incl. future CAN / TWAI bridges)              │
 │  • Sensing / Monitoring                                       │
 │  • Modular extension system (mods/hooks)                      │
 │  • Community compute distribution                             │
@@ -39,7 +39,7 @@ This is not "MetaField on top of Aurora" or "Aurora with some MetaField mods". I
 ┌──────────────────────────────────────────────────────────────┐
 │                    MetaField Intelligence Core                │
 │  • Lattice QCD Simulation (HMC + Wilson-Dirac)  ← one body    │
-│  • Optical / other physical field substrates    ← other bodies│
+│  • Optical / Ultrasonic / ZVS / other physical substrates     │
 │  • Learned Information Geometry (autoencoder + curvature)     │
 │  • Episodic Memory + Prioritized Replay                       │
 │  • Latent Predictor / Expectation Formation                   │
@@ -61,23 +61,26 @@ This is not "MetaField on top of Aurora" or "Aurora with some MetaField mods". I
 - Improve diagnostics and robustness
 - Begin light modularization of MetaField components
 - Define the Physical Field Interface abstraction (see `PHYSICAL_FIELD_SUBSTRATE.md`)
+- Capture ZVS node architecture + Phase-0 stub
 
 ### Phase 1 — First Integration
 - Make MetaField simulation + memory loop runnable as an Aurora worker/mod
 - Use Aurora’s scheduling instead of manual `--continuous` runs
 - Basic task distribution across machines via Aurora
 - Optical body: Phase 0 (passive observability) + Phase 1 (self-calibration / transfer map)
+- ZVS body: live TWAI telemetry as `FieldObservation`s
 
 ### Phase 2 — Deeper Integration
 - MetaField components become first-class Aurora mods (simulation, memory, prediction, geometry)
 - Aurora’s sensing layer feeds into MetaField memory
 - MetaField prediction/curvature signals begin influencing Aurora scheduling
 - Optical body: predictive model + first adaptive probing
+- Multi-body experiments (optical + ZVS coordinated via shared protocol)
 
 ### Phase 3 — Agency Emergence
 - Curiosity-driven exploration
 - Goal-directed behavior
-- Active experimentation ("What if we change β?" / "Which laser pattern yields most information?")
+- Active experimentation ("What if we change β?" / "Which laser pattern yields most information?" / "How does resonant health correlate with field response?")
 - Internal world modeling
 - MetaField memory/prediction systems start shaping long-term swarm behavior
 - Physical reconfiguration of bodies becomes possible
@@ -93,7 +96,8 @@ This is not "MetaField on top of Aurora" or "Aurora with some MetaField mods". I
 | Sensing              | Hardware + simulation state monitoring     | Feeds MetaField memory |
 | Mod/Hook System      | Plug in new MetaField behaviors + new bodies | Primary extension point |
 | Overlord / Control   | High-level swarm coordination              | Shared governance     |
-| Experimental nervous system | Schedule excitation sequences, replay | Optical / other bodies |
+| Experimental nervous system | Schedule excitation sequences, replay | Optical / ZVS / other bodies |
+| CAN / TWAI bridge    | Direct path from isolated power nodes      | Future transport      |
 
 ---
 
@@ -108,19 +112,20 @@ It combines:
 - The richness of a mathematically grounded physical simulation *and* real physical field substrates (MetaField)
 - The long-term possibility of emergent agency
 
-The optical dodecahedron (and any future body) is not “the AI.” It is a persistent physical environment that gives MetaField something to learn against.
+The optical dodecahedron, the ultrasonic array, and the ZVS resonant nodes are not “the AI.” They are persistent physical environments that give MetaField something to learn against.
 
 ---
 
-## Current Status (as of v1.23+)
+## Current Status (as of 2026-08)
 
 - Strong single-machine HMC + geometry + episodic memory + prediction
 - Continuous mode (`--continuous`) supported
 - Memory prioritization and online prediction working
 - Distributed multi-machine still fragile (Gloo + localhost issues)
-- Physical Field Substrate abstraction documented (`PHYSICAL_FIELD_SUBSTRATE.md`)
+- Physical Field Substrate abstraction documented and extended to ZVS
+- Optical and ZVS Phase-0 stubs available for parallel development
 
-Next focus: Stabilize single-machine experience, finish clean integration points with Aurora’s mod system, and begin Phase 0 passive observability for the first optical body.
+Next focus: Stabilize single-machine experience, finish clean integration points with Aurora’s mod system, begin Phase 0 passive observability for the first optical body, and bring ZVS telemetry online.
 
 ---
 

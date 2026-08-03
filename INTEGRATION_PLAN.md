@@ -1,6 +1,6 @@
 # MetaField + Aurora Integration Plan
 
-**Updated for v1.50 + Physical Field Substrate + Phase-0 stub**
+**Updated for v1.50 + Physical Field Substrate + Phase-0 stub + ZVS body**
 
 ---
 
@@ -32,7 +32,7 @@
   - Attractors are passed into geometry training so the manifold begins to deform around persistent basins
   - Attractor influence weight = 0.4
 - **Physical Field Substrate abstraction documented** (`PHYSICAL_FIELD_SUBSTRATE.md`)
-  - MetaField remains the intelligence layer; lattice / optical / WiFi / ultrasonic are interchangeable bodies
+  - MetaField remains the intelligence layer; lattice / optical / WiFi / ultrasonic / **ZVS** are interchangeable bodies
   - Higher-level observation schema preferred over raw sensor values
   - Formal `FieldObservation` types in `schemas/field_observation.py`
 - **Optical Phase-0 software stub** (`optical_body_stub.py`)
@@ -40,6 +40,10 @@
   - Emits valid `FieldObservation` packets
   - Replayable JSONL log
   - Lets Aurora / MetaField side develop in parallel with real hardware
+- **ZVS Phase-0 architecture + stub** (`zvs_body_stub.py`)
+  - Private hardware repo: [zvs-node](https://github.com/TheBabelDragon/zvs-node)
+  - Synthetic health / telemetry observations (current, voltage, temps, E-STOP)
+  - Same observation contract so MetaField can treat resonant-power health as just another modality
 
 ### Not yet (still gated)
 - Redis *publish* from MetaField into Aurora channels
@@ -47,6 +51,7 @@
 - Scheduler task wrapper for HMC continuous runs
 - Real optical hardware/firmware path (BPW34 + lasers)
 - Optical body Phase 1 (transfer-matrix self-calibration)
+- Real ZVS firmware (ESP32-S3 TWAI + isolated sensors)
 
 ---
 
@@ -97,13 +102,20 @@ python meta_field_distributed.py --world-size 1 --diagnostic --continuous --expo
 
 Writes a versioned `stats.json` that the `metafield_sensing` mod consumes. On clean exit the same file is updated to `health="stopped"`.
 
-Future bodies (optical, etc.) should publish into the same higher-level observation schema so the sensing surface remains body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md` and `schemas/field_observation.py`.
+Future bodies (optical, ZVS, etc.) should publish into the same higher-level observation schema so the sensing surface remains body-agnostic. See `PHYSICAL_FIELD_SUBSTRATE.md` and `schemas/field_observation.py`.
 
 Optical Phase-0 stub for parallel development:
 
 ```bash
 python optical_body_stub.py --clear-log --excitations 12
 python optical_body_stub.py --replay-only
+```
+
+ZVS Phase-0 stub:
+
+```bash
+python zvs_body_stub.py --clear-log --cycles 20
+python zvs_body_stub.py --replay-only
 ```
 
 ---
@@ -116,6 +128,7 @@ python optical_body_stub.py --replay-only
 4. Overlord start/stop of continuous runs under singleton lock
 5. Real optical hardware path replacing the synthetic stub (issue #1)
 6. Optical Phase 1 — transfer-matrix self-calibration
+7. ZVS firmware that emits live telemetry as `FieldObservation`s over CAN or serial
 
 ---
 
