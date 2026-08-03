@@ -5,7 +5,7 @@ field_observation.py
 Canonical, body-agnostic observation schema for MetaField.
 
 Any physical or simulated body (lattice HMC, optical dodecahedron,
-WiFi CSI, ultrasonic, …) should publish observations that conform
+WiFi CSI, ultrasonic, ZVS resonant/HV, …) should publish observations that conform
 to this shape. MetaField’s memory, geometry, prediction, and
 attractor layers consume this interface and remain unaware of the
 underlying sensor modality.
@@ -53,8 +53,8 @@ class FieldObservation:
     attach modality-specific context without polluting the core.
     """
     # Identity
-    body_id: str                    # e.g. "optical-dodeca-01", "lattice-sim-0"
-    body_type: str                  # "optical" | "lattice" | "wifi_csi" | "ultrasonic" | "sim"
+    body_id: str                    # e.g. "optical-dodeca-01", "lattice-sim-0", "zvs-node-03"
+    body_type: str                  # "optical" | "lattice" | "wifi_csi" | "ultrasonic" | "zvs" | "sim"
     excitation_id: Optional[int] = None   # sequential or hash of the stimulus
 
     # The actual field state
@@ -109,7 +109,7 @@ class FieldObservation:
 
 
 # ---------------------------------------------------------------------------
-# Convenience constructors for the two current bodies
+# Convenience constructors
 # ---------------------------------------------------------------------------
 
 def lattice_observation(
@@ -148,6 +148,24 @@ def optical_observation(
     )
 
 
+def zvs_observation(
+    body_id: str,
+    excitation_id: Optional[int],
+    regions: List[FieldRegion],
+    geometry_state: str = "calibrated",
+    power_extras: Optional[Dict[str, Any]] = None,
+) -> FieldObservation:
+    """Helper for the ZVS resonant / HV power body."""
+    return FieldObservation(
+        body_id=body_id,
+        body_type="zvs",
+        excitation_id=excitation_id,
+        field_regions=regions,
+        geometry_state=geometry_state,
+        modality={"zvs": power_extras or {}},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Minimal validation (fail-closed)
 # ---------------------------------------------------------------------------
@@ -157,7 +175,7 @@ def validate_observation(obs: FieldObservation) -> List[str]:
     problems: List[str] = []
     if not obs.body_id:
         problems.append("body_id is required")
-    if obs.body_type not in ("optical", "lattice", "wifi_csi", "ultrasonic", "sim", "other"):
+    if obs.body_type not in ("optical", "lattice", "wifi_csi", "ultrasonic", "zvs", "sim", "other"):
         problems.append(f"unknown body_type: {obs.body_type}")
     if not (0.0 <= obs.schema_version):
         problems.append("schema_version must be >= 0")
