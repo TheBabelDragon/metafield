@@ -1,21 +1,45 @@
 #!/usr/bin/env python3
 """
-metafield_sensing / entrypoint.py  (v0.2.3)
+metafield_sensing / entrypoint.py  (v0.3.0)
 
-Schema v4 includes Fisher metric diagnostics + scalar curvature.
+Schema v5: HMC + geometry + optional swarm credit mint totals (read-only).
 """
 
 from typing import Dict, Any, Optional
+import json
 import math
 from pathlib import Path
 
 try:
-    from security import read_local_stats, STATS_PATH, control_enabled
+    from security import read_local_stats, STATS_PATH, control_enabled, _runtime_dir
 except ImportError:
     read_local_stats = None
     STATS_PATH = Path("/tmp/metafield/stats.json")
+
     def control_enabled():
         return False
+
+    def _runtime_dir():
+        return Path("/tmp/metafield")
+
+
+def _read_mint_snapshot() -> Dict[str, Any]:
+    """Best-effort read of mint_state.json (never raises)."""
+    try:
+        p = _runtime_dir() / "mint_state.json"
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "total_credit": float(data.get("total_credit") or 0.0),
+            "last_traj": data.get("last_traj"),
+            "last_claim_id": data.get("last_claim_id"),
+            "last_mint_ts": data.get("last_mint_ts"),
+        }
+    except Exception:
+        return {}
 
 
 def get_metafield_stats() -> Dict[str, Any]:
@@ -25,10 +49,11 @@ def get_metafield_stats() -> Dict[str, Any]:
         data = None
         if STATS_PATH.exists():
             try:
-                import json
                 data = json.loads(STATS_PATH.read_text())
             except Exception:
                 data = None
+
+    mint = _read_mint_snapshot()
 
     if data is None:
         return {
@@ -40,6 +65,7 @@ def get_metafield_stats() -> Dict[str, Any]:
             "hmc": {},
             "geometry": {},
             "aurora": {},
+            "mint": mint,
             "control_enabled": control_enabled(),
             "source": str(STATS_PATH),
             "live": False,
@@ -49,7 +75,7 @@ def get_metafield_stats() -> Dict[str, Any]:
     live = data.get("live", health not in ("stopped", "no_export"))
 
     return {
-        "schema_version": data.get("schema_version", 1),
+        "schema_version": max(int(data.get("schema_version") or 1), 5),
         "version": data.get("version", "unknown"),
         "traj": data.get("traj"),
         "health": health,
@@ -59,6 +85,7 @@ def get_metafield_stats() -> Dict[str, Any]:
         "hmc": data.get("hmc", {}),
         "geometry": data.get("geometry", {}),
         "aurora": data.get("aurora", {}),
+        "mint": mint,
         "control_enabled": data.get("control_enabled", control_enabled()),
         "source": str(STATS_PATH),
         "live": live,
@@ -75,6 +102,10 @@ def on_sensing_tick(context: Any = None) -> None:
             print(f"[metafield_sensing] process stopped (at {stats.get('stopped_at', '?')})")
         else:
             print("[metafield_sensing] no live export yet")
+        mint = stats.get("mint") or {}
+        if mint.get("total_credit"):
+            print(f"[metafield_sensing] mint total_credit={mint.get('total_credit')} "
+                  f"last={mint.get('last_claim_id')}")
         return
 
     mem = stats.get("memory", {})
@@ -82,6 +113,7 @@ def on_sensing_tick(context: Any = None) -> None:
     hmc = stats.get("hmc", {})
     pred = stats.get("prediction", {})
     geom = stats.get("geometry", {})
+    mint = stats.get("mint") or {}
     health = stats.get("health", "?")
     traj = stats.get("traj", "?")
 
@@ -114,6 +146,11 @@ def on_sensing_tick(context: Any = None) -> None:
     if aurora.get("mode"):
         parts.append(f"aurora={aurora.get('mode')}")
 
+    if mint.get("total_credit") is not None:
+        parts.append(f"credit={float(mint.get('total_credit') or 0):.2f}")
+        if mint.get("last_claim_id"):
+            parts.append(f"claim={mint['last_claim_id']}")
+
     print("[metafield_sensing] " + " | ".join(parts))
 
 
@@ -125,7 +162,7 @@ def register() -> None:
     print("[metafield_sensing] Registering hooks (local-file mode, no Redis)...")
     print("[metafield_sensing] Control surface: "
           + ("enabled" if control_enabled() else "disabled"))
-    print("[metafield_sensing] Ready (read-only local stats, schema v4)")
+    print("[metafield_sensing] Ready (read-only local stats + mint, schema v5)")
 
 
 if __name__ == "__main__":
