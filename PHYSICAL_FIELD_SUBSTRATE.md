@@ -54,6 +54,37 @@ ESP32-S3 RAM → FRAM (identity) → MicroSD (archive) → MetaField memory
 
 ---
 
+## Light body — Dodecabox optical aperture mask (v1)
+
+The physical enclosure is **not** “paint some edges black.”  
+It is a defined **optical aperture mask** on each of the 12 identical pentagonal modules.
+
+Full specification: **[DODECABOX_OPTICAL_MASK.md](DODECABOX_OPTICAL_MASK.md)**
+
+Summary of the controlled optical graph:
+
+| Feature | Dimension |
+|---------|-----------|
+| Outer pentagon side | 37.103 mm |
+| Inner pentagon side | 26.714 mm |
+| Face separation | 11.56 mm |
+| Outer black border | 3.00 mm |
+| Inner cavity coating | 100 % matte black |
+| Edge optical gate width | 1.50 mm |
+| Vertex optical node | 2.00 mm |
+| Bond line | 0.10–0.20 mm |
+| Optional photon seam | 0.75 mm |
+
+Across 12 faces this yields:
+
+- **60** edge gates
+- **60** vertex optical nodes
+- **12** illumination / sensing surfaces
+
+The result is a black optical cavity with five controlled transmission channels per face — a defined optical graph instead of an uncontrolled glowing object.
+
+---
+
 ## ZVS Node (new)
 
 Isolated high-power resonant body:
@@ -138,6 +169,7 @@ MetaField decides meaning, surprise, prediction.
 
 ## See also
 
+- `DODECABOX_OPTICAL_MASK.md` — light-body aperture mask (v1)
 - `MEMORY_ARCHITECTURE.md`
 - `schemas/field_observation.py` / `schemas/field_memory.py`
 - `field_memory_store.py` / `optical_body_stub.py` / `zvs_body_stub.py` / `optical_serial_consumer.py`
