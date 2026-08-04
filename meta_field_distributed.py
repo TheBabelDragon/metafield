@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.59.1
+meta_field_distributed.py v1.59.2
 
-Bootstrap: fetch last known-good source, apply HMC + CLI fixes, then run.
+Bootstrap: fetch last known-good source, apply runtime patches, run.
+- HMC dynamical defaults: step=1e-4, leapfrog=150
+- --world-size defaults to 1 (local)
+- multi-rank only when RANK/WORLD_SIZE env (or torchrun) is present
 See HMC_TUNING.md.
 """
 from __future__ import annotations
@@ -16,30 +19,129 @@ _GOOD_URL = (
     "https://raw.githubusercontent.com/TheBabelDragon/metafield/"
     "458868180717aa684fd34a9c5a71d391a25dd625/meta_field_distributed.py"
 )
-
-# Bump cache name whenever patch logic changes
-_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v1591.py"
+_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v1592.py"
 
 
 def _patch(src: str) -> str:
-    src = src.replace('VERSION = "1.58"', 'VERSION = "1.59.1"', 1)
+    src = src.replace('VERSION = "1.58"', 'VERSION = "1.59.2"', 1)
     src = src.replace(
         "meta_field_distributed.py v1.58\n\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
-        "meta_field_distributed.py v1.59.1\n\n"
-        "HMC defaults tightened; --world-size defaults to 1 (single machine).\n"
+        "meta_field_distributed.py v1.59.2\n\n"
+        "Single-machine first. HMC step/leapfrog tightened. See HMC_TUNING.md.\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
         1,
     )
 
-    # Single-machine default: was 2 (forces broken distributed init)
+    # --- CLI: world-size default 1 + clearer help ---
     src = src.replace(
         'p.add_argument("--world-size", type=int, default=2)',
-        'p.add_argument("--world-size", type=int, default=1,\n'
-        '                    help="MPI/world ranks (default 1 = local single process)")',
+        'p.add_argument("--world-size", type=int, default=1, metavar="N",\n'
+        '                    help="process count (default: 1 local). "\n'
+        '                         "Use N>1 only with torchrun / RANK+WORLD_SIZE set.")',
         1,
     )
 
+    # --- Distributed init: don't try multi-rank on a lonely laptop ---
+    old_init = '''def init_distributed(args):
+    role = args.role
+    world_size = args.world_size
+    if role == "control":
+        rank = 0
+    elif role == "worker":
+        rank = args.rank if args.rank is not None else 1
+    else:
+        rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
+
+    master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
+
+    if world_size > 1:
+        if master_addr.startswith("127."):
+            print("\\n[CRITICAL ERROR] Resolving to localhost. Fix /etc/hosts.")
+            sys.exit(1)
+        print(f"[Distributed] Initializing... rank={rank} world_size={world_size} master={master_addr}")
+        try:
+            dist.init_process_group(backend=args.backend, init_method="env://", rank=rank, world_size=world_size)
+            print("[Distributed] OK")
+        except Exception as e:
+            print(f"[Distributed] Failed: {e}")
+            sys.exit(1)
+
+    print_banner(rank, world_size, role, args.diagnostic)
+    return rank, world_size, master_addr, args.master_port'''
+
+    new_init = '''def init_distributed(args):
+    role = args.role
+    world_size = args.world_size
+
+    # Honor torchrun / explicit env if present
+    env_world = os.environ.get("WORLD_SIZE")
+    env_rank = os.environ.get("RANK")
+    if env_world is not None:
+        try:
+            world_size = int(env_world)
+        except ValueError:
+            pass
+
+    if role == "control":
+        rank = 0
+    elif role == "worker":
+        rank = args.rank if args.rank is not None else 1
+    else:
+        if args.rank is not None:
+            rank = args.rank
+        elif env_rank is not None:
+            rank = int(env_rank)
+        else:
+            rank = 0
+
+    master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
+
+    # Solo machine safety: N>1 without a real distributed launcher → fall back to 1
+    launched = env_world is not None or env_rank is not None
+    if world_size > 1 and not launched and args.rank is None and role == "auto":
+        print(
+            f"[Distributed] world-size={world_size} requested but no RANK/WORLD_SIZE env "
+            f"(not under torchrun). Falling back to world-size=1 for local run."
+        )
+        print("  Tip: for real multi-rank use: torchrun --nproc_per_node=2 meta_field_distributed.py ...")
+        world_size = 1
+        rank = 0
+
+    if world_size > 1:
+        if master_addr.startswith("127."):
+            print("\\n[CRITICAL ERROR] master addr resolved to localhost.")
+            print("  Fix /etc/hosts hostname mapping, or pass --master-addr <LAN-IP>.")
+            sys.exit(1)
+        # torch.distributed env:// expects these
+        os.environ.setdefault("MASTER_ADDR", master_addr)
+        os.environ.setdefault("MASTER_PORT", str(args.master_port))
+        os.environ.setdefault("RANK", str(rank))
+        os.environ.setdefault("WORLD_SIZE", str(world_size))
+        print(f"[Distributed] Initializing... rank={rank} world_size={world_size} master={master_addr}")
+        try:
+            dist.init_process_group(
+                backend=args.backend,
+                init_method="env://",
+                rank=rank,
+                world_size=world_size,
+            )
+            print("[Distributed] OK")
+        except Exception as e:
+            print(f"[Distributed] Failed: {e}")
+            print("  For a single machine just omit --world-size (defaults to 1).")
+            sys.exit(1)
+
+    print_banner(rank, world_size, role, args.diagnostic)
+    return rank, world_size, master_addr, args.master_port'''
+
+    if old_init not in src:
+        # tolerate minor whitespace drift — still try a looser anchor
+        print("[boot] warning: init_distributed block not exact-matched; CLI default still patched")
+    else:
+        src = src.replace(old_init, new_init, 1)
+
+    # --- HMC defaults ---
     src = src.replace(
         "    # Nightcap defaults: slightly smaller step for ~50% accept, keep τ useful\n"
         "    if args.include_fermions:\n"
@@ -48,7 +150,7 @@ def _patch(src: str) -> str:
         "    else:\n"
         "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20\n"
         "        step_size = args.hmc_step if args.hmc_step is not None else 0.012",
-        "    # Dynamical defaults (see HMC_TUNING.md). Prior 0.0002×75 → ~20% accept.\n"
+        "    # Dynamical defaults (HMC_TUNING.md). Prior 0.0002×75 → ~20% accept.\n"
         "    if args.include_fermions:\n"
         "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 150\n"
         "        step_size = args.hmc_step if args.hmc_step is not None else 0.0001\n"
@@ -98,10 +200,10 @@ def _patch(src: str) -> str:
 
 
 def _ensure_impl() -> pathlib.Path:
-    if _CACHE.exists() and b'VERSION = "1.59.1"' in _CACHE.read_bytes():
+    if _CACHE.exists() and b'VERSION = "1.59.2"' in _CACHE.read_bytes():
         return _CACHE
-    print("[boot] fetching known-good body + applying v1.59.1 patches…")
-    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v1591-bootstrap"})
+    print("[boot] fetching known-good body + applying v1.59.2 patches…")
+    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v1592-bootstrap"})
     raw = urllib.request.urlopen(req, timeout=60).read().decode()
     patched = _patch(raw)
     _CACHE.write_text(patched)
