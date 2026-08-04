@@ -2,21 +2,14 @@
 """
 credit_mint.py
 
-Internal swarm-credit mint for MetaField × Aurora regulation.
+Internal swarm-credit mint — token-gated, Python-route, residual-hardened.
 
-Principles
-----------
-- Fail closed: no METAFIELD_CONTROL_TOKEN → no mint.
-- Python route only: evidence from runtime stats (not Git).
-- Local append-only claims log under the runtime dir.
-- Credits are internal regulation units, not chain assets.
-- Hardened: finite metrics only, abs(|dH|), credit caps, flock, env clamps.
-
-Usage
------
-  export METAFIELD_CONTROL_TOKEN=your-secret
-  python credit_mint.py
-  python credit_mint.py --watch
+Residual controls (v final):
+- continuous.lock must name a *live* PID
+- stats.json mtime must be fresh
+- runtime dir must not be world-writable
+- claims sealed with HMAC-SHA256 over evidence_hash using control token
+- finite metrics, abs(|dH|), credit caps, flock, env clamps
 """
 
 from __future__ import annotations
@@ -36,6 +29,9 @@ from security import (
     control_enabled,
     _runtime_dir,
     read_local_stats,
+    continuous_owner_alive,
+    assert_runtime_dir_safe,
+    stats_freshness_seconds,
 )
 from schemas.work_claim import WorkClaim
 
@@ -44,7 +40,7 @@ CLAIMS_PATH = _runtime_dir() / "work_claims.jsonl"
 MINT_STATE_PATH = _runtime_dir() / "mint_state.json"
 MINT_LOCK_PATH = _runtime_dir() / "mint.lock"
 
-# Regulation defaults (clamped on load — see _clamp_*)
+
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     try:
         v = int(os.environ.get(name, str(default)))
@@ -71,6 +67,10 @@ BASE_CREDIT = _env_float("METAFIELD_MINT_BASE_CREDIT", 1.0, 0.0, 100.0)
 MAX_CREDIT_PER_CLAIM = _env_float("METAFIELD_MINT_MAX_CREDIT", 10.0, 0.0, 1000.0)
 MAX_TOTAL_CREDIT = _env_float("METAFIELD_MINT_MAX_TOTAL", 1_000_000.0, 1.0, 1e12)
 MAX_CLAIMS_FILE_BYTES = _env_int("METAFIELD_MINT_MAX_CLAIMS_BYTES", 50_000_000, 1_000_000, 500_000_000)
+MAX_STATS_AGE_SEC = _env_float("METAFIELD_MINT_MAX_STATS_AGE", 120.0, 5.0, 3600.0)
+REQUIRE_LIVE_CONTINUOUS = os.environ.get("METAFIELD_MINT_REQUIRE_CONTINUOUS", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 class CreditMintError(RuntimeError):
@@ -88,8 +88,6 @@ def _finite(x: float, default: float = 0.0) -> float:
 
 
 class _MintFileLock:
-    """Best-effort exclusive lock so two mint processes cannot double-claim."""
-
     def __init__(self, path: Path = MINT_LOCK_PATH):
         self.path = path
         self._fd: Optional[int] = None
@@ -106,7 +104,6 @@ class _MintFileLock:
             self._fd = None
             return False
         except Exception:
-            # Non-POSIX: proceed without flock (still better than silent fail open)
             return True
 
     def release(self) -> None:
@@ -174,12 +171,9 @@ class CreditMint:
 
     def _score_credit(self, stats: Dict[str, Any]) -> Tuple[float, str]:
         hmc = stats.get("hmc") if isinstance(stats.get("hmc"), dict) else {}
-        accept = _finite(hmc.get("acceptance_rate"), 0.0)
+        accept = max(0.0, min(1.0, _finite(hmc.get("acceptance_rate"), 0.0)))
         abs_dh = abs(_finite(hmc.get("recent_abs_dh"), 0.0))
         health = str(stats.get("health") or "unknown")[:128]
-
-        # Clamp nonsense metrics from poisoned stats.json
-        accept = max(0.0, min(1.0, accept))
 
         if not stats.get("live", False):
             return 0.0, "not_live"
@@ -199,6 +193,27 @@ class CreditMint:
         reason = f"accept={accept:.2f} |dH|={abs_dh:.2f} health={health} q={quality:.2f}"
         return round(credit, 4), reason
 
+    def _assert_evidence_binding(self) -> None:
+        """Residual: refuse mint without live continuous owner + fresh stats."""
+        assert_runtime_dir_safe()
+
+        if REQUIRE_LIVE_CONTINUOUS:
+            alive, pid = continuous_owner_alive()
+            if not alive:
+                raise CreditMintError(
+                    f"no live continuous owner (lock pid={pid}). "
+                    f"Start MetaField --continuous before minting."
+                )
+
+        age = stats_freshness_seconds(self.stats_path)
+        if age is None:
+            raise CreditMintError(f"no stats at {self.stats_path}")
+        if age > MAX_STATS_AGE_SEC:
+            raise CreditMintError(
+                f"stats stale ({age:.0f}s > {MAX_STATS_AGE_SEC:.0f}s). "
+                f"Need live --export-stats writer."
+            )
+
     def try_mint_from_stats(
         self,
         token: Optional[str] = None,
@@ -208,12 +223,15 @@ class CreditMint:
         if provided is None and force_token_from_env:
             provided = get_control_token()
         require_control_token(provided)
+        assert provided is not None
 
         lock = _MintFileLock()
         if not lock.acquire():
             raise CreditMintError("another mint process holds mint.lock")
 
         try:
+            self._assert_evidence_binding()
+
             stats = read_local_stats(self.stats_path)
             if not stats or not isinstance(stats, dict):
                 raise CreditMintError(f"no stats at {self.stats_path} (run with --export-stats)")
@@ -223,7 +241,7 @@ class CreditMint:
                 traj = int(stats.get("traj") or 0)
             except (TypeError, ValueError):
                 traj = 0
-            traj = max(0, min(traj, 10**12))  # absurd upper bound
+            traj = max(0, min(traj, 10**12))
             now = time.time()
 
             last_traj = int(state.get("last_traj", -1) or -1)
@@ -242,7 +260,6 @@ class CreditMint:
             if credit <= 0.0:
                 return None
 
-            # Cap residual room under total
             credit = min(credit, max(0.0, MAX_TOTAL_CREDIT - total))
             if credit <= 0.0:
                 return None
@@ -250,6 +267,8 @@ class CreditMint:
             hmc = stats.get("hmc") if isinstance(stats.get("hmc"), dict) else {}
             mem = stats.get("memory") if isinstance(stats.get("memory"), dict) else {}
             att = stats.get("attractors") if isinstance(stats.get("attractors"), dict) else {}
+
+            alive, cont_pid = continuous_owner_alive()
 
             claim = WorkClaim(
                 node_id=str(stats.get("version", "metafield") or "metafield")[:64],
@@ -265,6 +284,8 @@ class CreditMint:
                 timestamp=now,
                 extras={
                     "schema_version_stats": stats.get("schema_version"),
+                    "continuous_pid": cont_pid if alive else None,
+                    "stats_age_sec": stats_freshness_seconds(self.stats_path),
                     "mint_regulation": {
                         "min_traj_delta": MIN_TRAJ_DELTA,
                         "min_accept": MIN_ACCEPT,
@@ -273,9 +294,13 @@ class CreditMint:
                         "base_credit": BASE_CREDIT,
                         "max_credit_per_claim": MAX_CREDIT_PER_CLAIM,
                         "max_total_credit": MAX_TOTAL_CREDIT,
+                        "max_stats_age_sec": MAX_STATS_AGE_SEC,
                     },
                 },
-            ).seal()
+            ).seal(token=provided)
+
+            if not claim.verify_mac(provided):
+                raise CreditMintError("internal MAC verify failed after seal")
 
             self._append_claim(claim)
             state["last_traj"] = traj
@@ -295,7 +320,6 @@ def main() -> None:
     p = argparse.ArgumentParser(description="MetaField token-gated swarm credit mint")
     p.add_argument("--watch", action="store_true", help="poll stats and mint when eligible")
     p.add_argument("--interval", type=float, default=15.0, help="watch poll seconds")
-    # Token only via env — CLI would leak into shell history / process list
     args = p.parse_args()
 
     if not control_enabled():
@@ -311,6 +335,10 @@ def main() -> None:
     mint = CreditMint()
     print(f"[mint] claims → {CLAIMS_PATH}")
     print(f"[mint] stats  ← {STATS_PATH}")
+    print(
+        f"[mint] residual: live_continuous={REQUIRE_LIVE_CONTINUOUS} "
+        f"max_stats_age={MAX_STATS_AGE_SEC}s HMAC=on"
+    )
     print(
         f"[mint] regulation: Δtraj≥{MIN_TRAJ_DELTA} accept≥{MIN_ACCEPT} "
         f"|dH|≤{MAX_ABS_DH} cooldown={COOLDOWN_SEC}s base={BASE_CREDIT} "
@@ -331,8 +359,8 @@ def main() -> None:
         else:
             print(
                 f"[mint] CLAIM {claim.claim_id} credit={claim.credit:.4f} "
-                f"traj={claim.traj} ({claim.reason}) "
-                f"total={mint.total_credit():.4f}"
+                f"traj={claim.traj} mac={claim.mac[:12]}… "
+                f"({claim.reason}) total={mint.total_credit():.4f}"
             )
 
     if not args.watch:
