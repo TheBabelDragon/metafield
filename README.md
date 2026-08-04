@@ -6,6 +6,69 @@ MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge th
 
 ---
 
+## Quick Start (Arch Linux)
+
+```bash
+# system packages
+sudo pacman -S --needed python python-pip python-virtualenv git
+
+# clone
+git clone https://github.com/TheBabelDragon/metafield.git
+cd metafield
+
+# venv (keep it outside the repo if you prefer)
+python -m venv .venv
+source .venv/bin/activate
+
+# deps
+pip install -U pip
+pip install -r requirements.txt
+# live ESP32 consumer (optional):
+pip install pyserial
+
+# lattice continuous run
+python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
+```
+
+Press `Ctrl+C` to stop cleanly.
+
+### Optical body path (no hardware required)
+
+```bash
+# synthetic passive sequence → JSONL
+python optical_body_stub.py --clear-log --excitations 12
+
+# promote observations → FieldMemoryEntry store
+python optical_serial_consumer.py \
+  --file /tmp/metafield/optical_phase0.jsonl \
+  --save /tmp/metafield/field_memory.jsonl
+
+# end-to-end smoke
+python examples/optical_memory_smoke.py
+
+# suggest next light (curiosity heuristic)
+python active_probe.py --from-store /tmp/metafield/field_memory.jsonl --emit-command
+```
+
+Live board (after firmware is flashed):
+
+```bash
+# find the port (often /dev/ttyACM0 or /dev/ttyUSB0 on Arch)
+ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
+
+# dialout group so you don't need root for serial
+sudo usermod -aG dialout $USER
+# log out/in once after that
+
+python optical_serial_consumer.py --port /dev/ttyACM0 --save /tmp/metafield/field_memory.jsonl
+```
+
+Optional flags for lattice run:
+- `--export-stats` — write local stats.json for the sensing mod
+- `--aurora-feed` — enable read-only drive force from Aurora (requires Redis)
+
+---
+
 ## Current Capabilities
 
 - Stable Hybrid Monte Carlo (HMC) with high acceptance rates
@@ -16,6 +79,7 @@ MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge th
 - Dynamic geometry training (epochs scale with data volume)
 - Efficient continuous mode (`--continuous`) with configurable system summaries
 - Aurora environment feed (read-only drive force from swarm sensing)
+- Physical Field Substrate (optical body schema, FieldMemoryStore, active_probe)
 
 ---
 
@@ -23,79 +87,24 @@ MetaField combines a stable Hybrid Monte Carlo engine for SU(3) lattice gauge th
 
 We have begun building toward a deep integration with [Aurora Swarm BTC](https://github.com/TheBabelDragon/aurora-swarm-btc).
 
-Aurora provides the distributed swarm infrastructure (node coordination, scheduling, community compute, and a clean mod/hook system) **and** acts as the experimental nervous system for physical bodies. MetaField provides the physics simulation + growing intelligence layer (memory, prediction, geometry).
+Aurora provides the distributed swarm infrastructure **and** acts as the experimental nervous system for physical bodies. MetaField provides the physics simulation + growing intelligence layer.
 
-### Current Integration Work
-
-- Created `aurora_mods/metafield_sensing/` — a proposed first mod that exposes MetaField memory, prediction, and geometry signals into Aurora’s sensing layer.
-- MetaField core components (`memory.py`, `prediction.py`, `geometry.py`) have been extracted and cleaned up for easier integration.
-- Strong emphasis on observability (`get_stats()`, periodic summaries) to support future Aurora sensing.
-- Read-only Aurora environment feed that modulates exploration and energy budgets.
-- **Physical Field Substrate** abstraction: lattice, optical, WiFi-CSI, ultrasonic, etc. are interchangeable *bodies* that feed the same MetaField intelligence layer via a higher-level observation schema. See `PHYSICAL_FIELD_SUBSTRATE.md`.
-
-See `aurora_mods/metafield_sensing/` for the current proposal and `INTEGRATION_PLAN.md` + `HYBRID_VISION.md` + `PHYSICAL_FIELD_SUBSTRATE.md` for the broader roadmap.
-
----
-
-## Quick Start
-
-```bash
-git clone https://github.com/TheBabelDragon/metafield.git
-cd metafield
-
-python -m venv ../.venv
-source ../.venv/bin/activate
-pip install -r requirements.txt
-
-# Recommended continuous run (single process)
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30
-```
-
-Press `Ctrl+C` to stop cleanly.
-
-Optional flags:
-- `--export-stats` — write local stats.json for the sensing mod
-- `--aurora-feed` — enable read-only drive force from Aurora (requires Redis)
-
----
-
-## Key Recent Improvements
-
-- System summary interval is now configurable via `--summary-interval`
-- Periodic high-level health + memory + prediction summaries in continuous mode
-- Major modularization (memory, prediction, and geometry extracted to their own files)
-- Aurora integration work started (`metafield_sensing` mod proposal)
-- Soft attractor influence on the learned geometry manifold
-- Physical Field Substrate direction documented (multi-body abstraction)
+See `aurora_mods/metafield_sensing/`, `INTEGRATION_PLAN.md`, `HYBRID_VISION.md`, `PHYSICAL_FIELD_SUBSTRATE.md`, `MEMORY_ARCHITECTURE.md`, `WHAT_WE_BUILT.md`.
 
 ---
 
 ## Key Components
 
-| Component                    | Description                                           |
-|-----------------------------|-------------------------------------------------------|
-| `DistributedHMC`            | Core Hybrid Monte Carlo engine                        |
-| `EpisodicMemory`            | Prioritized episodic memory with `get_stats()`        |
-| `LatentPredictor`           | Predicts future values from latent representations    |
-| `LearnedInformationGeometry`| Autoencoder + Riemannian geometry on fields           |
-| `AttractorDynamics`         | Persistent basins that deform the latent manifold     |
-| `AuroraFeed`                | Read-only environment drive force from the swarm      |
-
----
-
-## Continuous Mode (Recommended)
-
-```bash
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous --summary-interval 30 --export-stats
-```
-
-Long-running sessions are well supported and now include periodic system summaries and optional local stats export for Aurora sensing.
-
----
-
-## Multi-Machine
-
-Multi-machine support exists but is still sensitive to system configuration (common `127.0.1.1` hostname issue). The code prints clear guidance when this problem is detected.
+| Component | Description |
+|-----------|-------------|
+| `DistributedHMC` | Core Hybrid Monte Carlo engine |
+| `EpisodicMemory` | Lattice prioritized episodic memory |
+| `FieldMemoryStore` | Field-body episodic buffer (optical, etc.) |
+| `LatentPredictor` | Predicts future values from latents |
+| `LearnedInformationGeometry` | Autoencoder + Riemannian geometry |
+| `AttractorDynamics` | Persistent basins on the latent manifold |
+| `AuroraFeed` | Read-only environment drive from the swarm |
+| `active_probe` | Suggest next excitation from field memory |
 
 ---
 
@@ -103,8 +112,8 @@ Multi-machine support exists but is still sensitive to system configuration (com
 
 - Python 3.10+
 - PyTorch 2.0+
-- matplotlib (optional, for plots)
-- scikit-learn (optional, for PCA visualization of latents)
+- matplotlib / scikit-learn (optional)
+- pyserial (optional, live ESP32)
 
 ## License
 
