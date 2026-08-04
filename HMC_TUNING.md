@@ -12,17 +12,23 @@ Below ~0.35 accept with mean \|ΔH\| ≳ 1.5 → step is too large. Above ~0.90 
 
 ---
 
-## Defaults (v1.59+)
+## Defaults (v1.59.3+)
 
 **Dynamical (fermions on):**
 
 ```text
---hmc-step 0.0001
---hmc-leapfrog 150
+--hmc-step 5e-5
+--hmc-leapfrog 300
 τ = step × leapfrog ≈ 0.015
 ```
 
-(Previously `0.0002 × 75` produced \|ΔH\| ~ 2–5 and ~20% accept.)
+History on L=4⁴ β=5.5 dynamical:
+
+| step × leapfrog | typical \|ΔH\| | accept |
+|-----------------|---------------|--------|
+| 0.0002 × 75 | ~2–5 | ~20% |
+| 0.0001 × 150 | ~0.5–4 | ~35–45% |
+| **5e-5 × 300** | target ≲1 | target ~50–70% |
 
 **Quenched:**
 
@@ -38,17 +44,17 @@ Below ~0.35 accept with mean \|ΔH\| ≳ 1.5 → step is too large. Above ~0.90 
 1. Halve the step, double leapfrog (keeps τ roughly fixed):
 
 ```bash
-python meta_field_distributed.py --world-size 1 --diagnostic --continuous \
-  --hmc-step 5e-5 --hmc-leapfrog 300
+python meta_field_distributed.py --diagnostic --continuous \
+  --hmc-step 2.5e-5 --hmc-leapfrog 600
 ```
 
-2. Watch the first ~15 trajectories. You want mixed ACCEPT/REJECT and `dH` mostly O(1).
+2. Watch the first ~15 trajectories. Mixed ACCEPT/REJECT and `dH` mostly O(1).
 
-3. If still bad, halve step again and double leapfrog.
+3. If still bad, another half-step.
 
 4. Do **not** chase 95% accept — decorrelation suffers.
 
-Diagnostic runs print a one-line `[HMC tune]` suggestion around traj 14 if the early window looks unhealthy.
+Diagnostic runs print `[HMC tune]` around traj 14 if the early window looks unhealthy.
 
 ---
 
@@ -60,4 +66,6 @@ Diagnostic runs print a one-line `[HMC tune]` suggestion around traj 14 if the e
 # trajectory length τ = ε × L
 ```
 
-CG tolerances (`cg_tol_md`, `cg_tol_action`) are fine at current defaults; large ΔH with tiny residuals is an **integrator / step-size** issue, not a solver issue.
+CG is fine at current tols. Large ΔH with tiny residuals ⇒ **integrator / step-size**, not the solver.
+
+`--world-size` defaults to **1**. Multi-rank needs `torchrun` / `RANK`+`WORLD_SIZE`.
