@@ -2,9 +2,8 @@
 """
 WorkClaim — evidence that regulated MetaField work occurred.
 
-This is *not* a blockchain transaction and *not* external currency.
-It is an internal swarm credit claim derived from the Python runtime path
-(stats / HMC / continuity), gated by METAFIELD_CONTROL_TOKEN at mint time.
+Internal swarm credit claim from the Python runtime path.
+Integrity: evidence_hash (content) + mac (HMAC-SHA256 with control token).
 """
 
 from __future__ import annotations
@@ -13,10 +12,11 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Optional
 import time
 import hashlib
+import hmac
 import json
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -35,6 +35,7 @@ class WorkClaim:
     reason: str = ""
     timestamp: float = field(default_factory=lambda: time.time())
     evidence_hash: str = ""
+    mac: str = ""  # HMAC-SHA256 hex over evidence_hash with control token
     extras: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -45,7 +46,7 @@ class WorkClaim:
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore
         return cls(**{k: v for k, v in d.items() if k in known})
 
-    def compute_evidence_hash(self) -> str:
+    def _canonical_payload(self) -> str:
         payload = {
             "node_id": self.node_id,
             "traj": self.traj,
@@ -57,11 +58,31 @@ class WorkClaim:
             "credit": round(self.credit, 6),
             "timestamp": self.timestamp,
         }
-        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(blob.encode()).hexdigest()[:32]
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
-    def seal(self) -> "WorkClaim":
+    def compute_evidence_hash(self) -> str:
+        return hashlib.sha256(self._canonical_payload().encode()).hexdigest()[:32]
+
+    def seal(self, token: Optional[str] = None) -> "WorkClaim":
         if not self.claim_id:
             self.claim_id = f"wc_{int(self.timestamp)}_{self.traj}"
         self.evidence_hash = self.compute_evidence_hash()
+        if token:
+            self.mac = hmac.new(
+                token.encode("utf-8"),
+                self.evidence_hash.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+        else:
+            self.mac = ""
         return self
+
+    def verify_mac(self, token: str) -> bool:
+        if not token or not self.mac or not self.evidence_hash:
+            return False
+        expected = hmac.new(
+            token.encode("utf-8"),
+            self.evidence_hash.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, self.mac)
