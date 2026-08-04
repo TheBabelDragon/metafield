@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.59.2
+meta_field_distributed.py v1.59.3
 
 Bootstrap: fetch last known-good source, apply runtime patches, run.
-- HMC dynamical defaults: step=1e-4, leapfrog=150
+- HMC dynamical defaults: step=5e-5, leapfrog=300 (τ≈0.015)
 - --world-size defaults to 1 (local)
 - multi-rank only when RANK/WORLD_SIZE env (or torchrun) is present
 See HMC_TUNING.md.
@@ -19,21 +19,20 @@ _GOOD_URL = (
     "https://raw.githubusercontent.com/TheBabelDragon/metafield/"
     "458868180717aa684fd34a9c5a71d391a25dd625/meta_field_distributed.py"
 )
-_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v1592.py"
+_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v1593.py"
 
 
 def _patch(src: str) -> str:
-    src = src.replace('VERSION = "1.58"', 'VERSION = "1.59.2"', 1)
+    src = src.replace('VERSION = "1.58"', 'VERSION = "1.59.3"', 1)
     src = src.replace(
         "meta_field_distributed.py v1.58\n\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
-        "meta_field_distributed.py v1.59.2\n\n"
-        "Single-machine first. HMC step/leapfrog tightened. See HMC_TUNING.md.\n"
+        "meta_field_distributed.py v1.59.3\n\n"
+        "Single-machine first. HMC step 5e-5 × 300 leapfrog. See HMC_TUNING.md.\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
         1,
     )
 
-    # --- CLI: world-size default 1 + clearer help ---
     src = src.replace(
         'p.add_argument("--world-size", type=int, default=2)',
         'p.add_argument("--world-size", type=int, default=1, metavar="N",\n'
@@ -42,7 +41,6 @@ def _patch(src: str) -> str:
         1,
     )
 
-    # --- Distributed init: don't try multi-rank on a lonely laptop ---
     old_init = '''def init_distributed(args):
     role = args.role
     world_size = args.world_size
@@ -74,7 +72,6 @@ def _patch(src: str) -> str:
     role = args.role
     world_size = args.world_size
 
-    # Honor torchrun / explicit env if present
     env_world = os.environ.get("WORLD_SIZE")
     env_rank = os.environ.get("RANK")
     if env_world is not None:
@@ -97,7 +94,6 @@ def _patch(src: str) -> str:
 
     master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
 
-    # Solo machine safety: N>1 without a real distributed launcher → fall back to 1
     launched = env_world is not None or env_rank is not None
     if world_size > 1 and not launched and args.rank is None and role == "auto":
         print(
@@ -113,7 +109,6 @@ def _patch(src: str) -> str:
             print("\\n[CRITICAL ERROR] master addr resolved to localhost.")
             print("  Fix /etc/hosts hostname mapping, or pass --master-addr <LAN-IP>.")
             sys.exit(1)
-        # torch.distributed env:// expects these
         os.environ.setdefault("MASTER_ADDR", master_addr)
         os.environ.setdefault("MASTER_PORT", str(args.master_port))
         os.environ.setdefault("RANK", str(rank))
@@ -135,13 +130,10 @@ def _patch(src: str) -> str:
     print_banner(rank, world_size, role, args.diagnostic)
     return rank, world_size, master_addr, args.master_port'''
 
-    if old_init not in src:
-        # tolerate minor whitespace drift — still try a looser anchor
-        print("[boot] warning: init_distributed block not exact-matched; CLI default still patched")
-    else:
+    if old_init in src:
         src = src.replace(old_init, new_init, 1)
 
-    # --- HMC defaults ---
+    # HMC: another half-step from 1e-4×150 after observed ~35–45% accept / |ΔH|~1–4
     src = src.replace(
         "    # Nightcap defaults: slightly smaller step for ~50% accept, keep τ useful\n"
         "    if args.include_fermions:\n"
@@ -150,10 +142,10 @@ def _patch(src: str) -> str:
         "    else:\n"
         "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20\n"
         "        step_size = args.hmc_step if args.hmc_step is not None else 0.012",
-        "    # Dynamical defaults (HMC_TUNING.md). Prior 0.0002×75 → ~20% accept.\n"
+        "    # Dynamical defaults (HMC_TUNING.md). 5e-5×300 keeps τ≈0.015, tighter |ΔH|.\n"
         "    if args.include_fermions:\n"
-        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 150\n"
-        "        step_size = args.hmc_step if args.hmc_step is not None else 0.0001\n"
+        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 300\n"
+        "        step_size = args.hmc_step if args.hmc_step is not None else 5e-5\n"
         "    else:\n"
         "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20\n"
         "        step_size = args.hmc_step if args.hmc_step is not None else 0.012",
@@ -200,10 +192,10 @@ def _patch(src: str) -> str:
 
 
 def _ensure_impl() -> pathlib.Path:
-    if _CACHE.exists() and b'VERSION = "1.59.2"' in _CACHE.read_bytes():
+    if _CACHE.exists() and b'VERSION = "1.59.3"' in _CACHE.read_bytes():
         return _CACHE
-    print("[boot] fetching known-good body + applying v1.59.2 patches…")
-    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v1592-bootstrap"})
+    print("[boot] fetching known-good body + applying v1.59.3 patches…")
+    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v1593-bootstrap"})
     raw = urllib.request.urlopen(req, timeout=60).read().decode()
     patched = _patch(raw)
     _CACHE.write_text(patched)
