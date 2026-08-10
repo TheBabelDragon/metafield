@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-echo_automata.py — Field automata v0 (AND / threshold gates)
+echo_automata.py — Multi-level field automata
 
-Reads live Echo FieldObservation JSONL, scores residual with the trained
-head, evaluates simple gates, writes control events.
+Level 0 (atoms)
+  residual_high, fuse_agreed, has_tracks, high_motion, quiet
 
-Gates (v0):
+Level 1 (AND over atoms)
+  SURPRISE_CONFIRMED   = residual_high ∧ fuse_agreed
+  TRACKED_SURPRISE     = residual_high ∧ has_tracks
+  HIGH_MOTION_SURPRISE = residual_high ∧ high_motion
+  QUIET_ANOMALY        = residual_high ∧ quiet
 
-  SURPRISE_CONFIRMED  = |r| >= T  AND  fuse.agreed
-  TRACKED_SURPRISE    = |r| >= T  AND  n_tracks >= 1
-  HIGH_MOTION_SURPRISE= |r| >= T  AND  motion >= 0.6
-  QUIET_ANOMALY       = |r| >= T  AND  motion < 0.25
+Level 2 (composition / "duplication" of L1 patterns)
+  CONFIRMED_TRACK = SURPRISE_CONFIRMED ∧ TRACKED_SURPRISE
+  ACTIVE_FIELD    = HIGH_MOTION_SURPRISE ∧ (SURPRISE_CONFIRMED ∨ TRACKED_SURPRISE)
+  STEALTH_BREAK   = QUIET_ANOMALY ∧ has_tracks
+  FULL_LOCK       = CONFIRMED_TRACK ∧ HIGH_MOTION_SURPRISE
+
+L2 is where programmable field logic starts stacking — each level is pure
+boolean over the level below. Easy to extend.
 
 Usage:
 
   python examples/echo_automata.py --follow
-  python examples/echo_automata.py --follow --threshold 0.30
+  python examples/echo_automata.py --follow --threshold 0.30 --min-level 2
 
-See docs/ECHO_STACK.md for the full three-terminal setup.
+Echo follows echo_events.jsonl; higher-level gates get stronger φ boosts.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Set
 
 import torch
 
@@ -86,40 +94,79 @@ def follow_jsonl(path: Path, poll_s: float = 0.2):
 def region_map(obj: Dict[str, Any]) -> Dict[str, Any]:
     out = {}
     for r in obj.get("field_regions") or []:
-        name = str(r.get("region", ""))
-        out[name] = r
+        out[str(r.get("region", ""))] = r
     return out
 
 
-def eval_gates(
+def eval_atoms(
     abs_r: float,
     threshold: float,
     motion: float,
     fuse_agreed: bool,
     n_tracks: int,
-) -> List[str]:
-    if abs_r < threshold:
+) -> Dict[str, bool]:
+    """Level 0 — atomic predicates."""
+    return {
+        "residual_high": abs_r >= threshold,
+        "fuse_agreed": bool(fuse_agreed),
+        "has_tracks": n_tracks >= 1,
+        "high_motion": motion >= 0.6,
+        "quiet": motion < 0.25,
+    }
+
+
+def eval_l1(atoms: Dict[str, bool]) -> List[str]:
+    """Level 1 — AND gates over atoms."""
+    if not atoms["residual_high"]:
         return []
-    fired = []
-    if fuse_agreed:
-        fired.append("SURPRISE_CONFIRMED")
-    if n_tracks >= 1:
-        fired.append("TRACKED_SURPRISE")
-    if motion >= 0.6:
-        fired.append("HIGH_MOTION_SURPRISE")
-    if motion < 0.25:
-        fired.append("QUIET_ANOMALY")
-    if not fired:
-        fired.append("SURPRISE_RAW")
-    return fired
+    gates = []
+    if atoms["fuse_agreed"]:
+        gates.append("SURPRISE_CONFIRMED")
+    if atoms["has_tracks"]:
+        gates.append("TRACKED_SURPRISE")
+    if atoms["high_motion"]:
+        gates.append("HIGH_MOTION_SURPRISE")
+    if atoms["quiet"]:
+        gates.append("QUIET_ANOMALY")
+    if not gates:
+        gates.append("SURPRISE_RAW")
+    return gates
+
+
+def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
+    """Level 2 — composition of L1 (and a few atoms)."""
+    gates = []
+    if "SURPRISE_CONFIRMED" in l1 and "TRACKED_SURPRISE" in l1:
+        gates.append("CONFIRMED_TRACK")
+    if "HIGH_MOTION_SURPRISE" in l1 and (
+        "SURPRISE_CONFIRMED" in l1 or "TRACKED_SURPRISE" in l1
+    ):
+        gates.append("ACTIVE_FIELD")
+    if "QUIET_ANOMALY" in l1 and atoms["has_tracks"]:
+        gates.append("STEALTH_BREAK")
+    if "CONFIRMED_TRACK" in gates and "HIGH_MOTION_SURPRISE" in l1:
+        gates.append("FULL_LOCK")
+    # duplication: if FULL_LOCK, also emit CONFIRMED_TRACK + ACTIVE_FIELD as sustained
+    if "FULL_LOCK" in gates:
+        for g in ("CONFIRMED_TRACK", "ACTIVE_FIELD"):
+            if g not in gates:
+                gates.append(g)
+    return gates
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Echo field automata v0 (AND gates)")
+    p = argparse.ArgumentParser(description="Multi-level Echo field automata")
     p.add_argument("--file", type=Path, default=Path("/tmp/metafield/echo.jsonl"))
     p.add_argument("--model", type=Path, default=Path("/tmp/metafield/echo_head.pt"))
     p.add_argument("--threshold", type=float, default=0.30)
     p.add_argument("--events", type=Path, default=Path("/tmp/metafield/echo_events.jsonl"))
+    p.add_argument(
+        "--min-level",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="Only emit events that reach at least this gate level (1=L1, 2=L2)",
+    )
     p.add_argument("--no-follow", action="store_true")
     args = p.parse_args()
 
@@ -143,8 +190,9 @@ def main() -> None:
 
     frames = 0
     events = 0
-    print(f"[automata] threshold={args.threshold:.3f}  events→{args.events}")
-    print("[automata] gates: SURPRISE_CONFIRMED | TRACKED_SURPRISE | HIGH_MOTION_SURPRISE | QUIET_ANOMALY")
+    print(f"[automata] threshold={args.threshold:.3f}  min_level={args.min_level}  events→{args.events}")
+    print("[automata] L1: SURPRISE_CONFIRMED | TRACKED_SURPRISE | HIGH_MOTION_SURPRISE | QUIET_ANOMALY")
+    print("[automata] L2: CONFIRMED_TRACK | ACTIVE_FIELD | STEALTH_BREAK | FULL_LOCK")
 
     def handle(obj: Dict[str, Any]) -> None:
         nonlocal frames, events
@@ -172,16 +220,30 @@ def main() -> None:
         n_tracks = sum(1 for k in by if k.startswith("track_"))
         motion = actual_m
 
-        gates = eval_gates(abs_r, args.threshold, motion, fuse_agreed, n_tracks)
-        if not gates:
+        atoms = eval_atoms(abs_r, args.threshold, motion, fuse_agreed, n_tracks)
+        l1 = eval_l1(atoms)
+        l2 = eval_l2(set(l1), atoms)
+
+        if args.min_level >= 2 and not l2:
+            if frames % 50 == 0:
+                print(f"[automata] frames={frames} events={events} |r|={abs_r:.3f} (no L2)")
+            return
+        if args.min_level < 2 and not l1:
             if frames % 50 == 0:
                 print(f"[automata] frames={frames} events={events} |r|={abs_r:.3f}")
             return
 
+        level = 2 if l2 else 1
+        gates = list(dict.fromkeys(l2 + l1))  # L2 first, then L1, de-duped
+
         event = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "field_automata_event",
+            "level": level,
             "gates": gates,
+            "l1": l1,
+            "l2": l2,
+            "atoms": atoms,
             "body_id": obj.get("body_id", "echo-grid-01"),
             "abs_residual_motion": abs_r,
             "pred_motion": pred_m,
@@ -196,8 +258,11 @@ def main() -> None:
         ev_fh.write(json.dumps(event) + "\n")
         ev_fh.flush()
         events += 1
+
+        tag = f"L{level}"
+        shown = l2 if l2 else l1
         print(
-            f"[GATE] #{events}  {','.join(gates)}  "
+            f"[GATE {tag}] #{events}  {','.join(shown)}  "
             f"|r|={abs_r:.3f}  motion={motion:.2f}  "
             f"fuse={'Y' if fuse_agreed else 'n'}  tracks={n_tracks}"
         )
