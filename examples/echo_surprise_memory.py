@@ -24,7 +24,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+# allow running as python examples/echo_surprise_memory.py
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from schemas.field_memory import FieldMemoryEntry
 from schemas.field_observation import FieldObservation, validate_observation
@@ -77,7 +82,6 @@ def main() -> None:
     threshold = float(args.threshold) if args.threshold is not None else p90
     print(f"[surprise] echo={len(echo_rows)} residual_rows={len(res_rows)} threshold={threshold:.4f} (p90={p90:.4f})")
 
-    # residual.i is index into the feature series / echo observation stream
     surprises: List[tuple] = []
     args.save.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -100,7 +104,6 @@ def main() -> None:
             if problems:
                 print(f"[surprise] validation i={idx}: {problems}", file=sys.stderr)
 
-            # anomaly from residual magnitude, clipped to [0,1]
             anomaly = min(1.0, abs_r)
             entry = FieldMemoryEntry.from_observation(obs.to_dict())
             entry.anomaly = anomaly
