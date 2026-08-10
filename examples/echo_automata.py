@@ -11,21 +11,18 @@ Level 1 (AND over atoms)
   HIGH_MOTION_SURPRISE = residual_high ∧ high_motion
   QUIET_ANOMALY        = residual_high ∧ quiet
 
-Level 2 (composition / "duplication" of L1 patterns)
+Level 2 (composition of L1)
   CONFIRMED_TRACK = SURPRISE_CONFIRMED ∧ TRACKED_SURPRISE
   ACTIVE_FIELD    = HIGH_MOTION_SURPRISE ∧ (SURPRISE_CONFIRMED ∨ TRACKED_SURPRISE)
   STEALTH_BREAK   = QUIET_ANOMALY ∧ has_tracks
   FULL_LOCK       = CONFIRMED_TRACK ∧ HIGH_MOTION_SURPRISE
 
-L2 is where programmable field logic starts stacking — each level is pure
-boolean over the level below. Easy to extend.
-
 Usage:
 
-  python examples/echo_automata.py --follow
-  python examples/echo_automata.py --follow --threshold 0.30 --min-level 2
-
-Echo follows echo_events.jsonl; higher-level gates get stronger φ boosts.
+  python examples/echo_automata.py
+  python examples/echo_automata.py --follow --threshold 0.30
+  python examples/echo_automata.py --follow --min-level 2
+  python examples/echo_automata.py --no-follow   # score existing file once
 """
 
 from __future__ import annotations
@@ -45,6 +42,16 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def _normalize_argv(argv: List[str]) -> List[str]:
+    """Map unicode dashes (— – −) to ASCII '-' so pasted flags work."""
+    out = []
+    for a in argv:
+        for ch in ("\u2014", "\u2013", "\u2212"):  # em, en, minus
+            a = a.replace(ch, "-")
+        out.append(a)
+    return out
 
 
 def _load_predictor():
@@ -105,7 +112,6 @@ def eval_atoms(
     fuse_agreed: bool,
     n_tracks: int,
 ) -> Dict[str, bool]:
-    """Level 0 — atomic predicates."""
     return {
         "residual_high": abs_r >= threshold,
         "fuse_agreed": bool(fuse_agreed),
@@ -116,7 +122,6 @@ def eval_atoms(
 
 
 def eval_l1(atoms: Dict[str, bool]) -> List[str]:
-    """Level 1 — AND gates over atoms."""
     if not atoms["residual_high"]:
         return []
     gates = []
@@ -134,7 +139,6 @@ def eval_l1(atoms: Dict[str, bool]) -> List[str]:
 
 
 def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
-    """Level 2 — composition of L1 (and a few atoms)."""
     gates = []
     if "SURPRISE_CONFIRMED" in l1 and "TRACKED_SURPRISE" in l1:
         gates.append("CONFIRMED_TRACK")
@@ -146,7 +150,6 @@ def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
         gates.append("STEALTH_BREAK")
     if "CONFIRMED_TRACK" in gates and "HIGH_MOTION_SURPRISE" in l1:
         gates.append("FULL_LOCK")
-    # duplication: if FULL_LOCK, also emit CONFIRMED_TRACK + ACTIVE_FIELD as sustained
     if "FULL_LOCK" in gates:
         for g in ("CONFIRMED_TRACK", "ACTIVE_FIELD"):
             if g not in gates:
@@ -155,6 +158,8 @@ def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
 
 
 def main() -> None:
+    sys.argv = [sys.argv[0]] + _normalize_argv(sys.argv[1:])
+
     p = argparse.ArgumentParser(description="Multi-level Echo field automata")
     p.add_argument("--file", type=Path, default=Path("/tmp/metafield/echo.jsonl"))
     p.add_argument("--model", type=Path, default=Path("/tmp/metafield/echo_head.pt"))
@@ -167,8 +172,19 @@ def main() -> None:
         choices=(1, 2),
         help="Only emit events that reach at least this gate level (1=L1, 2=L2)",
     )
-    p.add_argument("--no-follow", action="store_true")
+    p.add_argument(
+        "--follow",
+        action="store_true",
+        default=True,
+        help="Tail the echo JSONL (default)",
+    )
+    p.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="Score existing file once, then exit",
+    )
     args = p.parse_args()
+    follow = not args.no_follow
 
     if not args.model.exists():
         print(f"[automata] missing model: {args.model}", file=sys.stderr)
@@ -234,7 +250,7 @@ def main() -> None:
             return
 
         level = 2 if l2 else 1
-        gates = list(dict.fromkeys(l2 + l1))  # L2 first, then L1, de-duped
+        gates = list(dict.fromkeys(l2 + l1))
 
         event = {
             "schema_version": 2,
@@ -259,16 +275,15 @@ def main() -> None:
         ev_fh.flush()
         events += 1
 
-        tag = f"L{level}"
         shown = l2 if l2 else l1
         print(
-            f"[GATE {tag}] #{events}  {','.join(shown)}  "
+            f"[GATE L{level}] #{events}  {','.join(shown)}  "
             f"|r|={abs_r:.3f}  motion={motion:.2f}  "
             f"fuse={'Y' if fuse_agreed else 'n'}  tracks={n_tracks}"
         )
 
     try:
-        if args.no_follow:
+        if not follow:
             if not args.file.exists():
                 print(f"[automata] missing {args.file}", file=sys.stderr)
                 sys.exit(1)
