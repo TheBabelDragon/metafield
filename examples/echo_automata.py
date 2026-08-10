@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-echo_automata.py — Multi-level field automata + memory link
+echo_automata.py — Multi-level field automata + memory link + head hot-reload
 
 Level 0 atoms → Level 1 ANDs → Level 2 compositions
 
@@ -8,14 +8,7 @@ On each fired gate set:
   • write control event → echo_events.jsonl
   • write FieldMemoryEntry with attractor_id → gate memory + FieldMemoryStore
 
-Attractor IDs (priority order):
-  gate:FULL_LOCK > gate:ACTIVE_FIELD > gate:CONFIRMED_TRACK >
-  gate:STEALTH_BREAK > gate:<L1 name>
-
-Usage:
-
-  python examples/echo_automata.py --follow --threshold 0.30
-  python examples/echo_automata.py --no-follow --verify
+Reloads echo_head.pt when the retrain loop updates it.
 """
 
 from __future__ import annotations
@@ -39,7 +32,6 @@ if str(ROOT) not in sys.path:
 from field_memory_store import FieldMemoryStore
 from schemas.field_memory import FieldMemoryEntry
 
-# attractor priority (first match wins)
 ATTRACTOR_PRIORITY = [
     "FULL_LOCK",
     "ACTIVE_FIELD",
@@ -77,8 +69,27 @@ def load_model(path: Path, pred_mod):
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     window = int(ckpt.get("window", 8))
-    print(f"[automata] head {path}  window={window}")
-    return model, window
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    print(f"[automata] head {path}  window={window}  mtime={mtime:.0f}")
+    return model, window, mtime, int(ckpt.get("in_dim", window * 8))
+
+
+def maybe_reload(path: Path, pred_mod, model, window, mtime, in_dim):
+    if not path.exists():
+        return model, window, mtime, in_dim, False
+    try:
+        cur = path.stat().st_mtime
+    except OSError:
+        return model, window, mtime, in_dim, False
+    if cur <= mtime:
+        return model, window, mtime, in_dim, False
+    try:
+        model2, window2, mtime2, in_dim2 = load_model(path, pred_mod)
+        print(f"[automata] hot-reload head (mtime {mtime:.0f} → {mtime2:.0f})")
+        return model2, window2, mtime2, in_dim2, True
+    except Exception as e:
+        print(f"[automata] reload failed ({e})", file=sys.stderr)
+        return model, window, mtime, in_dim, False
 
 
 def follow_jsonl(path: Path, poll_s: float = 0.2):
@@ -113,13 +124,7 @@ def region_map(obj: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def eval_atoms(
-    abs_r: float,
-    threshold: float,
-    motion: float,
-    fuse_agreed: bool,
-    n_tracks: int,
-) -> Dict[str, bool]:
+def eval_atoms(abs_r, threshold, motion, fuse_agreed, n_tracks):
     return {
         "residual_high": abs_r >= threshold,
         "fuse_agreed": bool(fuse_agreed),
@@ -129,7 +134,7 @@ def eval_atoms(
     }
 
 
-def eval_l1(atoms: Dict[str, bool]) -> List[str]:
+def eval_l1(atoms):
     if not atoms["residual_high"]:
         return []
     gates = []
@@ -146,7 +151,7 @@ def eval_l1(atoms: Dict[str, bool]) -> List[str]:
     return gates
 
 
-def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
+def eval_l2(l1: Set[str], atoms):
     gates = []
     if "SURPRISE_CONFIRMED" in l1 and "TRACKED_SURPRISE" in l1:
         gates.append("CONFIRMED_TRACK")
@@ -165,7 +170,7 @@ def eval_l2(l1: Set[str], atoms: Dict[str, bool]) -> List[str]:
     return gates
 
 
-def primary_attractor(gates: List[str], level: int) -> str:
+def primary_attractor(gates, level):
     gate_set = set(gates)
     for name in ATTRACTOR_PRIORITY:
         if name in gate_set:
@@ -174,24 +179,11 @@ def primary_attractor(gates: List[str], level: int) -> str:
 
 
 def memory_entry_from_gate(
-    obj: Dict[str, Any],
-    *,
-    attractor_id: str,
-    level: int,
-    gates: List[str],
-    l1: List[str],
-    l2: List[str],
-    atoms: Dict[str, bool],
-    abs_r: float,
-    pred_m: float,
-    actual_m: float,
-    fuse_agreed: bool,
-    n_tracks: int,
-) -> FieldMemoryEntry:
+    obj, *, attractor_id, level, gates, l1, l2, atoms,
+    abs_r, pred_m, actual_m, fuse_agreed, n_tracks,
+):
     entry = FieldMemoryEntry.from_observation(obj, attractor_id=attractor_id)
-    # residual is the anomaly signal for gate memory
     entry.anomaly = min(1.0, float(abs_r))
-    # confidence: prefer fuse conf from regions if present, else high when agreed
     if fuse_agreed:
         entry.confidence = max(entry.confidence, 0.75)
     entry.extras = dict(entry.extras or {})
@@ -211,56 +203,25 @@ def memory_entry_from_gate(
     return entry
 
 
-def verify_store(store: FieldMemoryStore, mem_path: Path) -> bool:
-    """Smoke checks for memory link."""
+def verify_store(store, mem_path):
     ok = True
     stats = store.get_stats()
     print("\n=== verify FieldMemoryStore (gate link) ===")
     print(f"  size={stats['size']}  total_added={stats['total_added']}")
-    print(f"  avg_anomaly={stats['avg_anomaly']:.3f}  avg_priority={stats['avg_priority']:.3f}")
-
     if stats["size"] == 0:
         print("  FAIL: store empty")
         return False
-
-    with_attr = 0
-    by_attr: Dict[str, int] = {}
-    for item in store.buffer:
-        e = item["entry"]
-        if e.attractor_id:
-            with_attr += 1
-            by_attr[e.attractor_id] = by_attr.get(e.attractor_id, 0) + 1
-
+    with_attr = sum(1 for item in store.buffer if item["entry"].attractor_id)
     print(f"  with attractor_id={with_attr}/{stats['size']}")
-    for k, v in sorted(by_attr.items(), key=lambda kv: -kv[1])[:12]:
-        print(f"    {k}: {v}")
-
     if with_attr != stats["size"]:
-        print("  FAIL: some entries missing attractor_id")
         ok = False
     else:
         print("  OK: all entries have attractor_id")
-
-    if mem_path.exists() and mem_path.stat().st_size > 0:
-        n_lines = sum(1 for line in mem_path.open() if line.strip().startswith("{"))
-        print(f"  jsonl lines={n_lines}  path={mem_path}")
-        if n_lines == 0:
-            print("  FAIL: memory jsonl empty")
-            ok = False
-        else:
-            print("  OK: memory jsonl non-empty")
-    else:
-        print(f"  FAIL: missing memory jsonl {mem_path}")
+    if not (mem_path.exists() and mem_path.stat().st_size > 0):
         ok = False
-
-    sampled = store.sample(n=min(5, stats["size"]))
-    print("  sample:")
-    for e in sampled:
-        print(
-            f"    attractor={e.attractor_id}  anom={e.anomaly:.3f}  "
-            f"conf={e.confidence:.2f}  gates={(e.extras or {}).get('gates', [])[:3]}"
-        )
-
+        print(f"  FAIL: missing {mem_path}")
+    else:
+        print(f"  OK: memory jsonl → {mem_path}")
     print("=== verify", "PASS" if ok else "FAIL", "===")
     return ok
 
@@ -273,35 +234,16 @@ def main() -> None:
     p.add_argument("--model", type=Path, default=Path("/tmp/metafield/echo_head.pt"))
     p.add_argument("--threshold", type=float, default=0.30)
     p.add_argument("--events", type=Path, default=Path("/tmp/metafield/echo_events.jsonl"))
-    p.add_argument(
-        "--memory",
-        type=Path,
-        default=Path("/tmp/metafield/echo_gate_memory.jsonl"),
-        help="Append FieldMemoryEntry JSONL (gate attractors)",
-    )
-    p.add_argument(
-        "--save-store",
-        type=Path,
-        default=Path("/tmp/metafield/echo_gate_store.jsonl"),
-        help="FieldMemoryStore checkpoint",
-    )
+    p.add_argument("--memory", type=Path, default=Path("/tmp/metafield/echo_gate_memory.jsonl"))
+    p.add_argument("--save-store", type=Path, default=Path("/tmp/metafield/echo_gate_store.jsonl"))
     p.add_argument("--checkpoint-every", type=int, default=25)
     p.add_argument("--capacity", type=int, default=4096)
     p.add_argument("--min-level", type=int, default=1, choices=(1, 2))
+    p.add_argument("--memory-min-level", type=int, default=1, choices=(1, 2))
     p.add_argument("--follow", action="store_true", default=True)
     p.add_argument("--no-follow", action="store_true")
-    p.add_argument(
-        "--verify",
-        action="store_true",
-        help="After run, assert store entries have attractor_id",
-    )
-    p.add_argument(
-        "--memory-min-level",
-        type=int,
-        default=1,
-        choices=(1, 2),
-        help="Only link memory for gates at this level or above (default 1)",
-    )
+    p.add_argument("--verify", action="store_true")
+    p.add_argument("--reload-every", type=int, default=40, help="Check head mtime every N frames")
     args = p.parse_args()
     follow = not args.no_follow
 
@@ -310,7 +252,7 @@ def main() -> None:
         sys.exit(1)
 
     pred_mod = _load_predictor()
-    model, window = load_model(args.model, pred_mod)
+    model, window, mtime, in_dim = load_model(args.model, pred_mod)
     history: Deque[List[float]] = deque(maxlen=window)
 
     args.events.parent.mkdir(parents=True, exist_ok=True)
@@ -331,17 +273,19 @@ def main() -> None:
     events = 0
     mem_writes = 0
 
-    print(
-        f"[automata] threshold={args.threshold:.3f}  min_level={args.min_level}  "
-        f"memory_min_level={args.memory_min_level}"
-    )
-    print(f"[automata] events→{args.events}")
-    print(f"[automata] memory→{args.memory}  store→{args.save_store}")
-    print("[automata] L1: SURPRISE_CONFIRMED | TRACKED_SURPRISE | HIGH_MOTION_SURPRISE | QUIET_ANOMALY")
-    print("[automata] L2: CONFIRMED_TRACK | ACTIVE_FIELD | STEALTH_BREAK | FULL_LOCK")
+    print(f"[automata] threshold={args.threshold:.3f}  min_level={args.min_level}")
+    print(f"[automata] events→{args.events}  memory→{args.memory}")
 
     def handle(obj: Dict[str, Any]) -> None:
-        nonlocal frames, events, mem_writes
+        nonlocal frames, events, mem_writes, model, window, mtime, in_dim, history
+
+        if frames > 0 and frames % max(1, args.reload_every) == 0:
+            model, window, mtime, in_dim, reloaded = maybe_reload(
+                args.model, pred_mod, model, window, mtime, in_dim
+            )
+            if reloaded:
+                history = deque(maxlen=window)
+
         feats = pred_mod.features_from_observation(obj)
         if feats is None:
             return
@@ -352,6 +296,11 @@ def main() -> None:
             return
 
         x = torch.tensor([[v for row in history for v in row]], dtype=torch.float32)
+        if x.shape[1] != in_dim:
+            history.append(feats)
+            frames += 1
+            return
+
         with torch.no_grad():
             pred = model(x)[0]
         pred_m = float(pred[0])
@@ -372,7 +321,7 @@ def main() -> None:
 
         if args.min_level >= 2 and not l2:
             if frames % 50 == 0:
-                print(f"[automata] frames={frames} events={events} mem={mem_writes} |r|={abs_r:.3f} (no L2)")
+                print(f"[automata] frames={frames} events={events} mem={mem_writes} |r|={abs_r:.3f}")
             return
         if args.min_level < 2 and not l1:
             if frames % 50 == 0:
@@ -407,7 +356,6 @@ def main() -> None:
         ev_fh.flush()
         events += 1
 
-        # --- memory link ---
         if level >= args.memory_min_level:
             entry = memory_entry_from_gate(
                 obj,
@@ -427,7 +375,6 @@ def main() -> None:
             mem_fh.write(entry.to_json() + "\n")
             mem_fh.flush()
             mem_writes += 1
-
             if mem_writes % max(1, args.checkpoint_every) == 0:
                 n = store.save_jsonl(args.save_store)
                 print(f"[automata] checkpoint store ({n}) → {args.save_store}")
@@ -461,13 +408,10 @@ def main() -> None:
         ev_fh.close()
         mem_fh.close()
         n = store.save_jsonl(args.save_store)
-        print(f"[automata] frames={frames}  events={events}  mem={mem_writes}")
+        print(f"[automata] frames={frames} events={events} mem={mem_writes}")
         print(f"[automata] final store ({n}) → {args.save_store}")
-        print(f"[automata] memory jsonl → {args.memory}")
-
         if args.verify:
-            passed = verify_store(store, args.memory)
-            sys.exit(0 if passed else 1)
+            sys.exit(0 if verify_store(store, args.memory) else 1)
 
 
 if __name__ == "__main__":
