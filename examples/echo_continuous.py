@@ -14,10 +14,9 @@ frame with the trained motion head, and on high residual:
 
 Usage:
 
-  # Echo already writing /tmp/metafield/echo.jsonl and head already trained
-  python examples/echo_continuous.py --follow
+  python examples/echo_continuous.py
 
-  python examples/echo_continuous.py --follow \
+  python examples/echo_continuous.py \
     --model /tmp/metafield/echo_head.pt \
     --threshold 0.30 \
     --save-surprise /tmp/metafield/echo_surprise_memory.jsonl \
@@ -29,6 +28,7 @@ Ctrl+C stops and flushes the store.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
@@ -45,9 +45,6 @@ if str(ROOT) not in sys.path:
 from field_memory_store import FieldMemoryStore
 from schemas.field_memory import FieldMemoryEntry
 from schemas.field_observation import FieldObservation
-
-# reuse feature + model defs from predictor
-import importlib.util
 
 
 def _load_predictor():
@@ -93,13 +90,11 @@ def features_for(obj: Dict[str, Any], pred_mod) -> Optional[List[float]]:
 
 
 def follow_jsonl(path: Path, poll_s: float = 0.2):
-    """Yield new JSON objects as the file grows. Waits if missing."""
     print(f"[continuous] waiting for {path} …")
     while not path.exists():
         time.sleep(poll_s)
     print(f"[continuous] following {path}")
     with path.open(encoding="utf-8") as fh:
-        # start at end if file already long? — read all then tail so window fills
         while True:
             line = fh.readline()
             if not line:
@@ -134,117 +129,9 @@ def main() -> None:
         type=Path,
         default=Path("/tmp/metafield/echo_store.jsonl"),
     )
-    p.add_argument("--checkpoint-every", type=int, default=25, help="Store flush every N surprises")
-    p.add_argument("--capacity", type=int, default=2048)
-    p.add_argument("--follow", action="store_true", default=True)
-    p.add_argument("--no-follow", action="store_true", help="One-shot existing file only")
-    args = p.parse_args()
-
-    pred_mod = _load_predictor()
-    model, window = load_model(args.model, pred_mod)
-
-    store = FieldMemoryStore(soft_capacity=args.capacity)
-    # warm-start from existing store/surprise if present
-    for warm in (args.save_store, args.save_surprise):
-        if warm.exists():
-            n = store.load_jsonl(warm)
-            if n:
-                print(f"[continuous] warm-loaded {n} from {warm}")
-
-    args.save_surprise.parent.mkdir(parents=True, exist_ok=True)
-    surprise_fh = args.save_surprise.open("a", encoding="utf-8")
-
-    feat_window: Deque[List[float]] = deque(maxlen=window)
-    frames = 0
-    surprises = 0
-    last_ckpt_surprises = 0
-
-    print(f"[continuous] threshold={args.threshold:.3f}  store_capacity={args.capacity}")
-    print("[continuous] running (Ctrl+C to stop)")
-
-    try:
-        stream = follow_jsonl(args.file) if not args.no_follow else None
-        if args.no_follow:
-            if not args.file.exists():
-                print(f"[continuous] missing {args.file}", file=sys.stderr)
-                sys.exit(1)
-
-            def _once():
-                with args.file.open(encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if line.startswith("{"):
-                            try:
-                                yield json.loads(line)
-                            except json.JSONDecodeError:
-                                pass
-
-            stream = _once()
-
-        assert stream is not None
-        for obj in stream:
-            feats = features_for(obj, pred_mod)
-            if feats is None:
-                continue
-            frames += 1
-            feat_window.append(feats)
-
-            if len(feat_window) < window:
-                if frames % 20 == 0:
-                    print(f"[continuous] warming window {len(feat_window)}/{window}")
-                continue
-
-            # predict next from past window; actual is current feats[0]=motion
-            past = list(feat_window)[:-1]  # window-1 history? — model trained on full window predicting next
-            # Training used: past = series[i-window:i] (length window) → predict series[i]
-            # So we need window frames of history BEFORE current. Current is last in deque.
-            if len(feat_window) < window:
-                continue
-            hist = list(feat_window)  # last element is "current" actual
-            # For live: use previous `window` frames as input — after append, deque has up to window items.
-            # Correct approach: keep a longer buffer.
-            # Simpler fix: use current deque as the *past* only after we move "actual" separately.
-
-            # Re-interpret: feat_window holds the last `window` feature vectors including current.
-            # Model expects `window` past frames to predict the *next*. So to score current,
-            # we need window frames before current. Maintain history separately.
-
-            # Actually after append, we have at most `window` items. We cannot have window past + current.
-            # Fix: maxlen = window + 0 means we score with the previous state...
-            # Rebuild: use maxlen window+1
-            pass
-
-    except KeyboardInterrupt:
-        print("\n[continuous] stopped")
-    finally:
-        surprise_fh.close()
-
-    # --- rewrite clean implementation below ---
-
-
-if __name__ == "__main__":
-    # Full clean body (avoids the partial draft above)
-    pred_mod = None  # placate type checkers if any
-
-
-def run() -> None:
-    p = argparse.ArgumentParser(description="Live Echo residual → FieldMemoryStore")
-    p.add_argument("--file", type=Path, default=Path("/tmp/metafield/echo.jsonl"))
-    p.add_argument("--model", type=Path, default=Path("/tmp/metafield/echo_head.pt"))
-    p.add_argument("--threshold", type=float, default=0.30)
-    p.add_argument(
-        "--save-surprise",
-        type=Path,
-        default=Path("/tmp/metafield/echo_surprise_memory.jsonl"),
-    )
-    p.add_argument(
-        "--save-store",
-        type=Path,
-        default=Path("/tmp/metafield/echo_store.jsonl"),
-    )
     p.add_argument("--checkpoint-every", type=int, default=25)
     p.add_argument("--capacity", type=int, default=2048)
-    p.add_argument("--no-follow", action="store_true")
+    p.add_argument("--no-follow", action="store_true", help="Score existing file once, then exit")
     args = p.parse_args()
 
     pred_mod = _load_predictor()
@@ -260,7 +147,6 @@ def run() -> None:
     args.save_surprise.parent.mkdir(parents=True, exist_ok=True)
     surprise_fh = args.save_surprise.open("a", encoding="utf-8")
 
-    # history length = window; score when we have window past + 1 current
     history: Deque[List[float]] = deque(maxlen=window)
     frames = 0
     surprises = 0
@@ -281,7 +167,6 @@ def run() -> None:
                 print(f"[continuous] warming {len(history)}/{window}")
             return
 
-        # history is past window; feats is current actual
         x = torch.tensor([[v for row in history for v in row]], dtype=torch.float32)
         with torch.no_grad():
             pred = model(x)[0]
@@ -291,7 +176,7 @@ def run() -> None:
         abs_r = abs(residual)
 
         frames += 1
-        history.append(feats)  # roll forward
+        history.append(feats)
 
         if frames % 40 == 0:
             print(
@@ -362,4 +247,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    main()
