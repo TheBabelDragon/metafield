@@ -2,8 +2,8 @@
 """
 echo_automata.py — Field automata v0 (AND / threshold gates)
 
-Reads live Echo FieldObservation JSONL (and optional residual from the
-trained head), evaluates simple gates, writes control events.
+Reads live Echo FieldObservation JSONL, scores residual with the trained
+head, evaluates simple gates, writes control events.
 
 Gates (v0):
 
@@ -12,20 +12,12 @@ Gates (v0):
   HIGH_MOTION_SURPRISE= |r| >= T  AND  motion >= 0.6
   QUIET_ANOMALY       = |r| >= T  AND  motion < 0.25
 
-These are the first programmable field-logic levels — not deep learning,
-just explicit multi-condition reactions on top of the learned residual.
-
 Usage:
 
-  # needs echo log + trained head
   python examples/echo_automata.py --follow
+  python examples/echo_automata.py --follow --threshold 0.30
 
-  python examples/echo_automata.py --follow \
-    --model /tmp/metafield/echo_head.pt \
-    --threshold 0.30 \
-    --events /tmp/metafield/echo_events.jsonl
-
-Echo can later follow echo_events.jsonl for gated HUD / drive reactions.
+See docs/ECHO_STACK.md for the full three-terminal setup.
 """
 
 from __future__ import annotations
@@ -133,6 +125,11 @@ def main() -> None:
 
     if not args.model.exists():
         print(f"[automata] missing model: {args.model}", file=sys.stderr)
+        print(
+            "  train: python examples/echo_field_predictor.py "
+            "--file /tmp/metafield/echo.jsonl --save-model /tmp/metafield/echo_head.pt",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     pred_mod = _load_predictor()
@@ -140,6 +137,8 @@ def main() -> None:
     history: Deque[List[float]] = deque(maxlen=window)
 
     args.events.parent.mkdir(parents=True, exist_ok=True)
+    if not args.events.exists():
+        args.events.touch()
     ev_fh = args.events.open("a", encoding="utf-8")
 
     frames = 0
