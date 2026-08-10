@@ -92,7 +92,9 @@ class FieldObservation:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FieldObservation":
         regions = [
-            FieldRegion(**r) if isinstance(r, dict) else r
+            FieldRegion(**{k: v for k, v in r.items() if k in (
+                "region", "expected", "observed", "confidence", "anomaly", "extras"
+            )}) if isinstance(r, dict) else r
             for r in data.get("field_regions", [])
         ]
         return cls(
@@ -145,6 +147,24 @@ def optical_observation(
         field_regions=regions,
         geometry_state=geometry_state,
         modality={"optical": transfer_matrix_hint or {}},
+    )
+
+
+def ultrasonic_observation(
+    body_id: str,
+    excitation_id: Optional[int],
+    regions: List[FieldRegion],
+    geometry_state: str = "calibrated",
+    echo_extras: Optional[Dict[str, Any]] = None,
+) -> FieldObservation:
+    """Helper for Echo Grid / ultrasonic field body."""
+    return FieldObservation(
+        body_id=body_id,
+        body_type="ultrasonic",
+        excitation_id=excitation_id,
+        field_regions=regions,
+        geometry_state=geometry_state,
+        modality={"echo": echo_extras or {}},
     )
 
 
