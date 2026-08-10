@@ -11,7 +11,6 @@ Uses the same FieldMemoryStore optical Phase-0 already uses. High residual
 
 Usage:
 
-  # after echo_surprise_memory.py (or let this auto-promote)
   python examples/echo_close_loop.py
 
   python examples/echo_close_loop.py \
@@ -23,10 +22,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -34,6 +34,16 @@ if str(ROOT) not in sys.path:
 
 from field_memory_store import FieldMemoryStore
 from schemas.field_memory import FieldMemoryEntry
+from schemas.field_observation import FieldObservation
+
+
+def _load_surprise_mod():
+    path = ROOT / "examples" / "echo_surprise_memory.py"
+    spec = importlib.util.spec_from_file_location("echo_surprise_memory", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def load_entries(path: Path) -> List[FieldMemoryEntry]:
@@ -68,24 +78,21 @@ def load_entries(path: Path) -> List[FieldMemoryEntry]:
 
 
 def ensure_surprise(args: argparse.Namespace) -> Path:
-    """Use existing surprise file or build it via echo_surprise_memory logic."""
     surprise = Path(args.surprise)
     if surprise.exists() and surprise.stat().st_size > 0:
         return surprise
 
     print(f"[loop] no surprise file at {surprise}; building…")
-    # import and run promoter in-process
-    from examples.echo_surprise_memory import find_residual_file, load_jsonl
-    from schemas.field_observation import FieldObservation, validate_observation
+    sm = _load_surprise_mod()
 
     echo = Path(args.echo)
     if not echo.exists():
         print(f"[loop] missing echo log: {echo}", file=sys.stderr)
         sys.exit(1)
 
-    residuals_path = find_residual_file(Path(args.residuals) if args.residuals else None)
-    echo_rows = load_jsonl(echo)
-    res_rows = load_jsonl(residuals_path)
+    residuals_path = sm.find_residual_file(Path(args.residuals) if args.residuals else None)
+    echo_rows = sm.load_jsonl(echo)
+    res_rows = sm.load_jsonl(residuals_path)
     if not res_rows:
         print("[loop] empty residuals — run predictor --score first", file=sys.stderr)
         sys.exit(1)
@@ -158,7 +165,6 @@ def main() -> None:
 
     store = FieldMemoryStore(soft_capacity=args.capacity)
 
-    # bulk first, then surprises so high-anomaly still ranks (priority on add)
     for e in bulk_entries:
         store.add(e)
     for e in surprise_entries:
