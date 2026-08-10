@@ -10,10 +10,15 @@ to predict next-step motion + entropy.
 
 Usage:
 
-  python examples/echo_field_predictor.py --file /tmp/metafield/echo.jsonl
-  python examples/echo_field_predictor.py --file /tmp/metafield/field_memory.jsonl --epochs 80
+  # train + optional save
+  python examples/echo_field_predictor.py --file /tmp/metafield/echo.jsonl \
+    --save-model /tmp/metafield/echo_head.pt
 
-No automata. Baseline only — measurable train/val MSE before anything deeper.
+  # score residuals with a saved head
+  python examples/echo_field_predictor.py --file /tmp/metafield/echo.jsonl \
+    --load-model /tmp/metafield/echo_head.pt --score /tmp/metafield/echo_residuals.jsonl
+
+Motion is the useful target on real CSI; entropy is often near-constant.
 """
 
 from __future__ import annotations
@@ -28,10 +33,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
 
 FEATURE_NAMES = [
     "motion", "entropy", "df_max", "drive", "fuse",
@@ -50,7 +51,6 @@ def _f(x: Any, default: float = 0.0) -> float:
 
 
 def features_from_observation(obj: Dict[str, Any]) -> Optional[List[float]]:
-    """Named regions from Echo FieldObservation packets."""
     regions = obj.get("field_regions") or []
     by_name: Dict[str, Dict[str, Any]] = {}
     tracks = []
@@ -74,7 +74,6 @@ def features_from_observation(obj: Dict[str, Any]) -> Optional[List[float]]:
     else:
         te, tc = 0.0, 0.0
 
-    # modality fallback if regions sparse
     mod = (obj.get("modality") or {}).get("echo") or {}
     if motion == 0.0 and "motion" in mod:
         motion = _f(mod.get("motion"))
@@ -85,11 +84,9 @@ def features_from_observation(obj: Dict[str, Any]) -> Optional[List[float]]:
 
 
 def features_from_memory_entry(obj: Dict[str, Any]) -> Optional[List[float]]:
-    """Flattened FieldMemoryEntry (order depends on emission)."""
     obs = obj.get("observed_response") or []
     if not obs:
         return None
-    # pad/truncate to 5 core slots: motion, entropy, df_max, drive, fuse
     core = [_f(v) for v in obs[:5]]
     while len(core) < 5:
         core.append(0.0)
@@ -119,9 +116,7 @@ def load_feature_series(path: Path) -> List[List[float]]:
             elif "observed_response" in obj or "body_id" in obj:
                 feats = features_from_memory_entry(obj)
 
-            if feats is None:
-                continue
-            if len(feats) != len(FEATURE_NAMES):
+            if feats is None or len(feats) != len(FEATURE_NAMES):
                 continue
             series.append(feats)
     return series
@@ -131,10 +126,6 @@ def make_windows(
     series: List[List[float]],
     window: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    X: [N, window * F] past features
-    Y: [N, 2] next motion, next entropy
-    """
     if len(series) < window + 1:
         raise SystemExit(
             f"[predictor] need at least {window + 1} samples, got {len(series)}"
@@ -145,14 +136,8 @@ def make_windows(
         nxt = series[i]
         xs.append([v for row in past for v in row])
         ys.append([nxt[0], nxt[1]])  # motion, entropy
-    X = torch.tensor(xs, dtype=torch.float32)
-    Y = torch.tensor(ys, dtype=torch.float32)
-    return X, Y
+    return torch.tensor(xs, dtype=torch.float32), torch.tensor(ys, dtype=torch.float32)
 
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
 
 class TinyFieldHead(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64):
@@ -163,7 +148,7 @@ class TinyFieldHead(nn.Module):
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 2),
-            nn.Sigmoid(),  # motion/entropy in [0,1]
+            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -177,14 +162,13 @@ def train_eval(
     lr: float,
     val_frac: float,
     seed: int,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], TinyFieldHead]:
     n = X.shape[0]
     n_val = max(1, int(n * val_frac))
     n_train = n - n_val
     if n_train < 8:
         raise SystemExit(f"[predictor] too few train samples ({n_train})")
 
-    # temporal split (no shuffle) — respect causality
     Xtr, Ytr = X[:n_train], Y[:n_train]
     Xva, Yva = X[n_train:], Y[n_train:]
 
@@ -223,18 +207,16 @@ def train_eval(
     model.eval()
     with torch.no_grad():
         pred = model(Xva)
-        # per-target
         mse_motion = float(((pred[:, 0] - Yva[:, 0]) ** 2).mean().item())
         mse_entropy = float(((pred[:, 1] - Yva[:, 1]) ** 2).mean().item())
-        # naive baseline: predict last window's motion/entropy (persistence)
-        # last frame in window is features [window-1]
         F = len(FEATURE_NAMES)
-        last_motion = Xva[:, (window_idx := (X.shape[1] // F - 1) * F) + 0]
+        window_idx = (X.shape[1] // F - 1) * F
+        last_motion = Xva[:, window_idx + 0]
         last_entropy = Xva[:, window_idx + 1]
         base_m = float(((last_motion - Yva[:, 0]) ** 2).mean().item())
         base_e = float(((last_entropy - Yva[:, 1]) ** 2).mean().item())
 
-    return {
+    stats = {
         "n_total": float(n),
         "n_train": float(n_train),
         "n_val": float(n_val),
@@ -245,26 +227,69 @@ def train_eval(
         "baseline_mse_motion": base_m,
         "baseline_mse_entropy": base_e,
     }
+    return stats, model
+
+
+def score_series(
+    series: List[List[float]],
+    model: TinyFieldHead,
+    window: int,
+    out_path: Path,
+) -> None:
+    """Write residual JSONL: pred vs actual motion (primary signal)."""
+    model.eval()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    residuals = []
+    with out_path.open("w", encoding="utf-8") as fh, torch.no_grad():
+        for i in range(window, len(series)):
+            past = series[i - window : i]
+            x = torch.tensor([[v for row in past for v in row]], dtype=torch.float32)
+            pred = model(x)[0]
+            actual_m, actual_e = series[i][0], series[i][1]
+            pred_m, pred_e = float(pred[0]), float(pred[1])
+            res_m = actual_m - pred_m
+            row = {
+                "i": i,
+                "actual_motion": actual_m,
+                "pred_motion": pred_m,
+                "residual_motion": res_m,
+                "abs_residual_motion": abs(res_m),
+                "actual_entropy": actual_e,
+                "pred_entropy": pred_e,
+            }
+            residuals.append(abs(res_m))
+            fh.write(json.dumps(row) + "\n")
+
+    if not residuals:
+        print("[predictor] no score rows")
+        return
+    residuals.sort()
+    n = len(residuals)
+    mean_r = sum(residuals) / n
+    p50 = residuals[n // 2]
+    p90 = residuals[int(n * 0.9)]
+    p99 = residuals[min(n - 1, int(n * 0.99))]
+    print()
+    print("=== score (motion residual) ===")
+    print(f"  rows={n}  mean|r|={mean_r:.4f}  p50={p50:.4f}  p90={p90:.4f}  p99={p99:.4f}")
+    print(f"  wrote → {out_path}")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Tiny Echo field predictor baseline")
-    p.add_argument(
-        "--file",
-        type=Path,
-        default=Path("/tmp/metafield/echo.jsonl"),
-        help="FieldObservation or FieldMemoryEntry JSONL",
-    )
-    p.add_argument("--window", type=int, default=8, help="Past frames in input")
+    p = argparse.ArgumentParser(description="Tiny Echo field predictor")
+    p.add_argument("--file", type=Path, default=Path("/tmp/metafield/echo.jsonl"))
+    p.add_argument("--window", type=int, default=8)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--val-frac", type=float, default=0.25)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save-model", type=Path, default=None)
+    p.add_argument("--load-model", type=Path, default=None)
     p.add_argument(
-        "--save-model",
+        "--score",
         type=Path,
         default=None,
-        help="Optional path to save state_dict",
+        help="Write residual JSONL here (trains or uses --load-model)",
     )
     args = p.parse_args()
 
@@ -276,67 +301,65 @@ def main() -> None:
     series = load_feature_series(args.file)
     print(f"[predictor] samples={len(series)}  features={FEATURE_NAMES}")
     if len(series) < args.window + 5:
-        print(
-            f"[predictor] not enough data ({len(series)}). "
-            f"Collect more with Echo --metafield-log then retry.",
-            file=sys.stderr,
-        )
+        print(f"[predictor] not enough data ({len(series)})", file=sys.stderr)
         sys.exit(1)
 
     X, Y = make_windows(series, args.window)
     print(f"[predictor] windows={X.shape[0]}  in_dim={X.shape[1]}  targets=motion,entropy")
-    print("[predictor] training…")
-    stats = train_eval(X, Y, args.epochs, args.lr, args.val_frac, args.seed)
 
-    print()
-    print("=== baseline result ===")
-    print(f"  samples     train={int(stats['n_train'])}  val={int(stats['n_val'])}")
-    print(f"  val MSE     {stats['val_mse']:.5f}  (best)")
-    print(f"  val motion  {stats['val_mse_motion']:.5f}  vs persistence {stats['baseline_mse_motion']:.5f}")
-    print(f"  val entropy {stats['val_mse_entropy']:.5f}  vs persistence {stats['baseline_mse_entropy']:.5f}")
-    better_m = stats["val_mse_motion"] < stats["baseline_mse_motion"]
-    better_e = stats["val_mse_entropy"] < stats["baseline_mse_entropy"]
-    print(f"  beats persistence?  motion={'yes' if better_m else 'no'}  entropy={'yes' if better_e else 'no'}")
+    model: TinyFieldHead
+    stats: Optional[Dict[str, float]] = None
 
-    if args.save_model:
-        # retrain path already has best weights inside train_eval only in-memory;
-        # quick re-fit for save
-        model = TinyFieldHead(in_dim=X.shape[1])
-        # reload best by re-running is heavy; save last trained via second pass
-        n = X.shape[0]
-        n_val = max(1, int(n * args.val_frac))
-        n_train = n - n_val
-        Xtr, Ytr = X[:n_train], Y[:n_train]
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-        loss_fn = nn.MSELoss()
-        best_val = float("inf")
-        best_state = None
-        for _ in range(args.epochs):
-            model.train()
-            opt.zero_grad()
-            loss = loss_fn(model(Xtr), Ytr)
-            loss.backward()
-            opt.step()
-            model.eval()
-            with torch.no_grad():
-                v = float(loss_fn(model(X[n_train:]), Y[n_train:]).item())
-            if v < best_val:
-                best_val = v
-                best_state = {k: v2.detach().clone() for k, v2 in model.state_dict().items()}
-        if best_state:
-            model.load_state_dict(best_state)
-        args.save_model.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                "feature_names": FEATURE_NAMES,
-                "window": args.window,
-                "in_dim": X.shape[1],
-                "stats": stats,
-            },
-            args.save_model,
+    if args.load_model:
+        ckpt = torch.load(args.load_model, map_location="cpu", weights_only=False)
+        model = TinyFieldHead(in_dim=int(ckpt["in_dim"]))
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+        print(f"[predictor] loaded {args.load_model}")
+        if "stats" in ckpt:
+            s = ckpt["stats"]
+            print(
+                f"  (ckpt val motion {s.get('val_mse_motion', float('nan')):.5f} "
+                f"vs persistence {s.get('baseline_mse_motion', float('nan')):.5f})"
+            )
+    else:
+        print("[predictor] training…")
+        stats, model = train_eval(X, Y, args.epochs, args.lr, args.val_frac, args.seed)
+        print()
+        print("=== baseline result ===")
+        print(f"  samples     train={int(stats['n_train'])}  val={int(stats['n_val'])}")
+        print(f"  val MSE     {stats['val_mse']:.5f}  (best)")
+        print(
+            f"  val motion  {stats['val_mse_motion']:.5f}  "
+            f"vs persistence {stats['baseline_mse_motion']:.5f}"
         )
-        print(f"[predictor] saved model → {args.save_model}")
+        print(
+            f"  val entropy {stats['val_mse_entropy']:.5f}  "
+            f"vs persistence {stats['baseline_mse_entropy']:.5f}"
+        )
+        better_m = stats["val_mse_motion"] < stats["baseline_mse_motion"]
+        better_e = stats["val_mse_entropy"] < stats["baseline_mse_entropy"]
+        print(
+            f"  beats persistence?  motion={'yes' if better_m else 'no'}  "
+            f"entropy={'yes' if better_e else 'no'}"
+        )
+
+        if args.save_model:
+            args.save_model.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "feature_names": FEATURE_NAMES,
+                    "window": args.window,
+                    "in_dim": X.shape[1],
+                    "stats": stats,
+                },
+                args.save_model,
+            )
+            print(f"[predictor] saved model → {args.save_model}")
+
+    if args.score:
+        score_series(series, model, args.window, args.score)
 
 
 if __name__ == "__main__":
