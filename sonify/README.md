@@ -2,6 +2,19 @@
 
 MetaField → AXIOM bridge via plain JSONL.
 
+**Decouples lattice QCD from MIDI.** The sim never imports musical code; AXIOM never imports lattice code.
+
+## Status (2026-08-14)
+
+Package is complete on `main`. If `meta_field_sim_torch.py` was clobbered during integration, restore it first:
+
+```bash
+git checkout c46d1f4096eaa7be687da1c24873666b47c95102 -- meta_field_sim_torch.py
+patch -p1 < sonify/instrument_sim.patch
+```
+
+See issue #2 for details.
+
 ## Contract
 
 After each HMC trajectory the sim appends one line to a `.jsonl` file:
@@ -19,10 +32,17 @@ After each HMC trajectory the sim appends one line to a `.jsonl` file:
 }
 ```
 
+Enable emission with:
+
+```python
+sim = MetaFieldSimulationV2(..., observables_jsonl="/tmp/metafield/observables.jsonl")
+sim.run()
+```
+
 ## Offline export
 
 ```bash
-python -m sonify.export run.jsonl -o axiom_notes.json --ticks-per-step 8
+python -m sonify.export /tmp/metafield/observables.jsonl -o axiom_notes.json --ticks-per-step 8
 ```
 
 ## Mapping (edit `mapping.py`)
@@ -35,4 +55,12 @@ python -m sonify.export run.jsonl -o axiom_notes.json --ticks-per-step 8
 | `fisher_curvature` | note velocity |
 | `topological_charge` spike | crash (49) + accent |
 
-AXIOM imports `axiom_notes.json` via `_import_metafield_run`.
+## AXIOM side (still local / private)
+
+1. Add track `Track('physics', 'Metafield', 'strings')` + `TCOLORS['physics']`
+2. `_import_metafield_run(path)` reading `axiom_notes.json`
+3. "Import Run" button → `dialogs.pick_document()`
+
+## Stretch — live sonification
+
+Sim writes JSON lines to a TCP socket; `PhysicsBridge` thread in `DAWView` calls `trk.add_note()` in real time.
