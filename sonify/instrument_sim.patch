@@ -1,0 +1,47 @@
+--- a/meta_field_sim_torch.py
++++ b/meta_field_sim_torch.py
+@@ -813,8 +813,10 @@
+                  use_learned_geometry: bool = False,
+                  geometry_latent_dim: int = 3,
+                  geometry_batch_size: int = 4,
+-                 geometry_report_every: int = 5):
++                 geometry_report_every: int = 5,
++                 observables_jsonl: Optional[str] = None):
+         self.config = config or ConfigV2()
++        self.observables_jsonl = observables_jsonl
+         torch.manual_seed(self.config.seed)
+         self.generator = torch.Generator().manual_seed(self.config.seed)
+ 
+@@ -907,6 +909,24 @@
+                 f"CG: {iters} iters, resid={resid:.2e}{geom_line}"
+             )
+ 
++            # Sonify contract: plain JSONL, no musical imports either direction
++            if self.observables_jsonl:
++                try:
++                    from sonify.observables import build_record, append_jsonl
++                    fish = record.get("scalar_curvature")
++                    obs = build_record(
++                        step=traj,
++                        traj_id=traj,
++                        accepted=bool(hmc_result["accepted"]),
++                        gauge=self.gauge,
++                        fisher_curvature=fish,
++                        cg_residual=float(resid) if resid is not None else float("nan"),
++                        cg_iters=int(iters) if iters is not None else 0,
++                    )
++                    append_jsonl(self.observables_jsonl, obs)
++                except Exception as e:
++                    print(f"[sonify] emit failed on traj {traj}: {type(e).__name__}: {e}")
++
+         return self.history
+ 
+ 
+@@ -926,5 +946,7 @@
+         geometry_latent_dim=3,
+         geometry_batch_size=4,
+         geometry_report_every=5,
++        observables_jsonl="/tmp/metafield/observables.jsonl",
+     )
+     sim.run()
++    print("observables → /tmp/metafield/observables.jsonl")
