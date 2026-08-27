@@ -49,3 +49,21 @@ class ConfigV2:
     seed: int = 0
     device: str = "cpu"             # set to "cuda" if available
     dtype: torch.dtype = torch.complex128
+
+
+# ---------------------------------------------------------------------------
+# su(N) algebra helpers
+# ---------------------------------------------------------------------------
+
+def dagger(M: "torch.Tensor") -> "torch.Tensor":
+    return M.conj().transpose(-1, -2)
+
+
+def project_traceless_antihermitian(M: "torch.Tensor") -> "torch.Tensor":
+    """Project onto su(N): traceless, anti-Hermitian."""
+    n = M.shape[-1]
+    A = 0.5 * (M - dagger(M))
+    tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(-1)
+    eye = torch.eye(n, dtype=M.dtype, device=M.device)
+    A = A - (tr / n)[..., None, None] * eye
+    return A
