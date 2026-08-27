@@ -1,5 +1,15 @@
 from __future__ import annotations
 
-# TEMP: file was overwritten with PLACEHOLDER. Restoring minimally.
-# Full restore in next commit.
-raise RuntimeError('meta_field_sim_torch.py is being restored — pull again in a moment')
+import math
+from dataclasses import dataclass
+from typing import Optional, Callable, Tuple, Dict, Any, List
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "meta_field_sim_torch.py requires PyTorch. Install it with:\n"
+        "    pip install torch\n"
+        "(GPU build if you have CUDA: see https://pytorch.org/get-started/locally/)"
+    ) from e
