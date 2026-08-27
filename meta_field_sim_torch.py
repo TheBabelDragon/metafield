@@ -1,69 +1,107 @@
-"""Wilson + HMC core for MetaField.
-
-On main this path was overwritten with a raising placeholder. The known-good
-~930-line implementation lives at commit 4588681 (blob 43d9b430). This module
-fetches that exact body once, caches it next to the repo, and executes it in
-place so imports and the L=4 smoke tests see the real classes.
-
-To vendor the file permanently (no network):
-
-    curl -L https://raw.githubusercontent.com/TheBabelDragon/metafield/458868180717aa684fd34a9c5a71d391a25dd625/meta_field_sim_torch.py \\
-      -o meta_field_sim_torch.py
-"""
 from __future__ import annotations
 
-import pathlib
-import runpy
-import sys
-import urllib.request
+import math
+from dataclasses import dataclass
+from typing import Optional, Callable, Tuple, Dict, Any, List
 
-_GOOD_COMMIT = "458868180717aa684fd34a9c5a71d391a25dd625"
-_GOOD_URL = (
-    "https://raw.githubusercontent.com/TheBabelDragon/metafield/"
-    f"{_GOOD_COMMIT}/meta_field_sim_torch.py"
-)
-_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_sim_torch.4588681.py"
-_MARKER = "class MetaFieldSimulationV2"
-
-
-def _ensure_body() -> pathlib.Path:
-    if _CACHE.exists() and _MARKER.encode() in _CACHE.read_bytes():
-        return _CACHE
-    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-sim-restore"})
-    raw = urllib.request.urlopen(req, timeout=60).read()
-    if _MARKER.encode() not in raw:
-        raise RuntimeError(
-            f"refusing to cache a body that does not define {_MARKER!r} "
-            f"(fetched {_GOOD_URL})"
-        )
-    _CACHE.write_bytes(raw)
-    return _CACHE
+try:
+    import torch
+    import torch.nn as nn
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "meta_field_sim_torch.py requires PyTorch. Install it with:\n"
+        "    pip install torch\n"
+        "(GPU build if you have CUDA: see https://pytorch.org/get-started/locally/)"
+    ) from e
 
 
-def _load() -> None:
-    body = _ensure_body()
-    ns = runpy.run_path(str(body), run_name=__name__)
-    g = globals()
-    for key, val in ns.items():
-        if key == "__name__":
-            continue
-        g[key] = val
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConfigV2:
+    L: int = 4                    # keep small by default -- Wilson-Dirac + CG is much
+    n_dims: int = 4                 # heavier per step than the NumPy toy version
+    color_dim: int = 3
+    spinor_dim: int = 4             # 4-component Euclidean Dirac spinor
+
+    mass: float = 0.1               # bare fermion mass
+    wilson_r: float = 1.0           # Wilson parameter (r=1 standard, lifts doublers)
+
+    beta: float = 5.5               # inverse gauge coupling (Wilson gauge action)
+
+    hmc_n_leapfrog: int = 10
+    hmc_step_size: float = 0.05
+    hmc_trajectories: int = 20
+
+    include_fermions: bool = False   # False = quenched (gauge-only) HMC, as before.
+                                       # True = dynamical fermions via pseudofermion heatbath.
+    cg_tol: float = 1e-8
+    cg_maxiter: int = 200
+    # Production HMC codes typically use a looser CG tolerance during the
+    # molecular-dynamics force evaluations (called many times per trajectory,
+    # speed matters) and a tight tolerance for the Metropolis energy check
+    # (accuracy matters, called only twice per trajectory). Mirrored here.
+    cg_tol_md: float = 1e-6
+    cg_tol_action: float = 1e-10
+
+    seed: int = 0
+    device: str = "cpu"             # set to "cuda" if available
+    dtype: torch.dtype = torch.complex128
 
 
-_load()
+# ---------------------------------------------------------------------------
+# su(N) algebra helpers
+# ---------------------------------------------------------------------------
+
+def dagger(M: "torch.Tensor") -> "torch.Tensor":
+    return M.conj().transpose(-1, -2)
 
 
-if __name__ == "__main__":
-    # Re-run the vendored __main__ block if the body defined a simulation entry.
-    if "MetaFieldSimulationV2" in globals() and "ConfigV2" in globals():
-        config = ConfigV2(  # type: ignore[name-defined]
-            L=4,
-            beta=5.5,
-            hmc_n_leapfrog=10,
-            hmc_step_size=0.05,
-            hmc_trajectories=4,
-            include_fermions=False,
-            seed=42,
-        )
-        sim = MetaFieldSimulationV2(config, use_learned_geometry=False)  # type: ignore[name-defined]
-        sim.run()
+def project_traceless_antihermitian(M: "torch.Tensor") -> "torch.Tensor":
+    """Project onto su(N): traceless, anti-Hermitian."""
+    n = M.shape[-1]
+    A = 0.5 * (M - dagger(M))
+    tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(-1)
+    eye = torch.eye(n, dtype=M.dtype, device=M.device)
+    A = A - (tr / n)[..., None, None] * eye
+    return A
+
+
+def project_traceless_hermitian(M: "torch.Tensor") -> "torch.Tensor":
+    """Project onto traceless Hermitian matrices (used for HMC momenta)."""
+    n = M.shape[-1]
+    H = 0.5 * (M + dagger(M))
+    tr = torch.diagonal(H, dim1=-2, dim2=-1).sum(-1)
+    eye = torch.eye(n, dtype=M.dtype, device=M.device)
+    H = H - (tr / n)[..., None, None] * eye
+    return H
+
+
+def expm_anti_hermitian(X: "torch.Tensor") -> "torch.Tensor":
+    """
+    Exact exponential of a batch of anti-Hermitian matrices via a
+    Hermitian eigendecomposition: H = i X is Hermitian, so
+    exp(X) = exp(-i H) = V diag(exp(-i lambda)) V^dagger with lambda
+    real. Result is exactly unitary regardless of step size.
+    """
+    H = 1j * X
+    eigvals, eigvecs = torch.linalg.eigh(H)              # eigvals real, (..., N)
+    phase = torch.exp(-1j * eigvals.to(X.dtype))
+    Vh = dagger(eigvecs)
+    scaled_Vh = phase[..., :, None] * Vh
+    return eigvecs @ scaled_Vh
+
+
+def random_su_n_hermitian(shape: Tuple[int, ...], n: int, dtype, device,
+                           generator: "torch.Generator") -> "torch.Tensor":
+    """Random traceless-Hermitian matrix batch (for HMC momenta / noise)."""
+    real = torch.randn(shape, generator=generator, dtype=torch.float64, device=device)
+    imag = torch.randn(shape, generator=generator, dtype=torch.float64, device=device)
+    A = (real + 1j * imag).to(dtype)
+    H = 0.5 * (A + dagger(A))
+    tr = torch.diagonal(H, dim1=-2, dim2=-1).sum(-1)
+    eye = torch.eye(n, dtype=dtype, device=device)
+    H = H - (tr / n)[..., None, None] * eye
+    return H
