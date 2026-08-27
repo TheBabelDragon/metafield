@@ -150,3 +150,7 @@ cython_debug/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Cached vendor bodies pulled by the temporary bootstraps
+.meta_field_sim_torch.*.py
+.meta_field_distributed.v*.py
