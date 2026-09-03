@@ -16,7 +16,7 @@ import hmac
 import json
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -33,7 +33,10 @@ class WorkClaim:
     num_attractors: int = 0
     credit: float = 0.0
     reason: str = ""
-    timestamp: float = field(default_factory=lambda: time.time())
+    timestamp: float = field(default_factory=lambda: time.time())  # observed_at only
+    btc_height: Optional[int] = None
+    btc_work: Optional[str] = None
+    clock_confidence: str = "none"
     evidence_hash: str = ""
     mac: str = ""  # HMAC-SHA256 hex over evidence_hash with control token
     extras: Dict[str, Any] = field(default_factory=dict)
@@ -47,6 +50,7 @@ class WorkClaim:
         return cls(**{k: v for k, v in d.items() if k in known})
 
     def _canonical_payload(self) -> str:
+        # Wall timestamp is not part of claim identity.
         payload = {
             "node_id": self.node_id,
             "traj": self.traj,
@@ -56,7 +60,9 @@ class WorkClaim:
             "memory_size": self.memory_size,
             "num_attractors": self.num_attractors,
             "credit": round(self.credit, 6),
-            "timestamp": self.timestamp,
+            "btc_height": self.btc_height,
+            "btc_work": self.btc_work,
+            "clock_confidence": self.clock_confidence,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -65,7 +71,8 @@ class WorkClaim:
 
     def seal(self, token: Optional[str] = None) -> "WorkClaim":
         if not self.claim_id:
-            self.claim_id = f"wc_{int(self.timestamp)}_{self.traj}"
+            height = self.btc_height if self.btc_height is not None else "u"
+            self.claim_id = f"wc_{height}_{self.traj}"
         self.evidence_hash = self.compute_evidence_hash()
         if token:
             self.mac = hmac.new(
