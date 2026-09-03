@@ -89,7 +89,9 @@ We have begun building toward a deep integration with [Aurora Swarm BTC](https:/
 
 Aurora provides the distributed swarm infrastructure **and** acts as the experimental nervous system for physical bodies. MetaField provides the physics simulation + growing intelligence layer.
 
-See `aurora_mods/metafield_sensing/`, `INTEGRATION_PLAN.md`, `HYBRID_VISION.md`, `PHYSICAL_FIELD_SUBSTRATE.md`, `MEMORY_ARCHITECTURE.md`, `WHAT_WE_BUILT.md`.
+See `aurora_mods/metafield_sensing/`, `INTEGRATION_PLAN.md`, `HYBRID_VISION.md`, `PHYSICAL_FIELD_SUBSTRATE.md`, `MEMORY_ARCHITECTURE.md`, `SCARCITY_CLOCK.md`, `WHAT_WE_BUILT.md`.
+
+**Clock:** `btc_height` is the coarse epoch. Cumulative work is scarcity weight. `observed_at` is informational. Local wall time is never the observation epoch.
 
 ---
 

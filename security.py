@@ -3,16 +3,6 @@
 security.py
 
 Backend security overlay for MetaField continuous / control paths.
-
-Goals:
-- Prohibit duplicate continuous runs (singleton lock)
-- Keep control surfaces closed by default
-- Require an explicit token for any future control / overlord commands
-- Provide a safe local stats export path (no Redis until auth is ready)
-- Residual helpers for mint: live continuous owner, runtime dir permissions
-
-Escape hatch (still no manual rm):
-    METAFIELD_FORCE_UNLOCK=1
 """
 
 from __future__ import annotations
@@ -76,10 +66,6 @@ def _now_iso() -> str:
 
 
 def continuous_owner_alive(path: Path = LOCK_PATH) -> Tuple[bool, Optional[int]]:
-    """
-    True if continuous.lock exists and names a live PID.
-    Used by mint so credits require a living continuous process.
-    """
     if not path.exists():
         return False, None
     try:
@@ -93,10 +79,6 @@ def continuous_owner_alive(path: Path = LOCK_PATH) -> Tuple[bool, Optional[int]]
 
 
 def assert_runtime_dir_safe(path: Optional[Path] = None) -> None:
-    """
-    Refuse world-writable runtime dirs (stats/claims poisoning surface).
-    Best-effort on platforms without POSIX modes.
-    """
     d = path or _runtime_dir()
     try:
         mode = d.stat().st_mode
@@ -107,13 +89,9 @@ def assert_runtime_dir_safe(path: Optional[Path] = None) -> None:
             f"Runtime dir is world-writable: {d} (mode={oct(mode & 0o777)}). "
             f"chmod go-w or set METAFIELD_RUNTIME_DIR to a private path."
         )
-    # Also warn-level: group-writable on multi-user hosts is risky; fail only if
-    # METAFIELD_STRICT_RUNTIME=1
     if os.environ.get("METAFIELD_STRICT_RUNTIME", "").strip() in ("1", "true", "yes"):
         if mode & stat.S_IWGRP:
-            raise PermissionError(
-                f"Runtime dir is group-writable under STRICT mode: {d}"
-            )
+            raise PermissionError(f"Runtime dir is group-writable under STRICT mode: {d}")
 
 
 class ContinuousLock:
@@ -145,7 +123,6 @@ class ContinuousLock:
     def acquire(self) -> None:
         assert_runtime_dir_safe(self.path.parent)
         data = self._read_lock()
-
         if data is not None and not self._is_stale(data):
             old_pid = data.get("pid", "?")
             old_host = data.get("hostname", "?")
@@ -156,25 +133,16 @@ class ContinuousLock:
                 f"If you are certain it is gone, set METAFIELD_FORCE_UNLOCK=1 "
                 f"and retry (no manual file deletion required)."
             )
-
         if self.path.exists():
             old_pid = data.get("pid", "?") if data else "?"
             old_host = data.get("hostname", "?") if data else "?"
-            reason = "force unlock" if os.environ.get(FORCE_UNLOCK_ENV, "").strip() in ("1", "true", "yes", "on") \
-                     else "dead/corrupt/stale owner"
+            reason = "force unlock" if os.environ.get(FORCE_UNLOCK_ENV, "").strip() in ("1", "true", "yes", "on") else "dead/corrupt/stale owner"
             try:
                 self.path.unlink(missing_ok=True)
-                print(f"[Security] Auto-cleaned continuous lock "
-                      f"({reason}; old pid={old_pid}, host={old_host})")
+                print(f"[Security] Auto-cleaned continuous lock ({reason}; old pid={old_pid}, host={old_host})")
             except Exception as e:
-                print(f"[Security] Warning: could not unlink old lock ({e}); "
-                      f"attempting overwrite")
-
-        payload = {
-            "pid": os.getpid(),
-            "hostname": socket.gethostname(),
-            "started": _now_iso(),
-        }
+                print(f"[Security] Warning: could not unlink old lock ({e}); attempting overwrite")
+        payload = {"pid": os.getpid(), "hostname": socket.gethostname(), "started": _now_iso()}
         tmp = self.path.with_suffix(".lock.tmp")
         try:
             tmp.write_text(json.dumps(payload, indent=2))
@@ -200,7 +168,6 @@ class ContinuousLock:
         except Exception:
             pass
         self.held = False
-
         if write_stopped_stats:
             try:
                 existing = read_local_stats() or {}
@@ -221,8 +188,7 @@ def require_control_token(provided: Optional[str]) -> None:
     expected = get_control_token()
     if expected is None:
         raise PermissionError(
-            f"Control surface is disabled. Set {TOKEN_ENV} to enable "
-            f"authenticated overlord/control commands."
+            f"Control surface is disabled. Set {TOKEN_ENV} to enable authenticated overlord/control commands."
         )
     if not provided or not secrets.compare_digest(provided, expected):
         raise PermissionError("Invalid or missing control token.")
@@ -234,6 +200,27 @@ def control_enabled() -> bool:
 
 def write_local_stats(stats: Dict[str, Any], path: Path = STATS_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from schemas.scarcity_clock import attach_clock
+        stats = attach_clock(dict(stats))
+    except Exception:
+        stats = dict(stats)
+        stats.setdefault(
+            "clock",
+            {
+                "clock_version": 1,
+                "epoch": None,
+                "btc_height": None,
+                "btc_block_hash": None,
+                "btc_work": None,
+                "anchor_id": None,
+                "observed_at": 0.0,
+                "confidence": "none",
+                "source": "none",
+                "authoritative": False,
+                "anchored": False,
+            },
+        )
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(stats, indent=2, default=str))
     try:
@@ -253,7 +240,6 @@ def read_local_stats(path: Path = STATS_PATH) -> Optional[Dict[str, Any]]:
 
 
 def stats_freshness_seconds(path: Path = STATS_PATH) -> Optional[float]:
-    """Seconds since stats.json mtime, or None if missing."""
     if not path.exists():
         return None
     try:

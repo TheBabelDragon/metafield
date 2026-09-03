@@ -20,24 +20,21 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
 
+from schemas.scarcity_clock import ScarcityClock, parse_clock
 
-# ---------------------------------------------------------------------------
-# Core types
-# ---------------------------------------------------------------------------
 
 @dataclass
 class FieldRegion:
     """One coherent region of the observed field."""
-    region: str                     # stable identifier, e.g. "bottom_plane_cluster_3"
+    region: str
     expected: Optional[float] = None
     observed: Optional[float] = None
-    confidence: float = 0.0         # 0..1
-    anomaly: float = 0.0            # 0..1, higher = more anomalous
+    confidence: float = 0.0
+    anomaly: float = 0.0
     extras: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # drop empty extras for cleaner JSON
         if not d["extras"]:
             del d["extras"]
         return d
@@ -45,33 +42,21 @@ class FieldRegion:
 
 @dataclass
 class FieldObservation:
-    """
-    Single observation packet emitted by any body.
-
-    Required fields keep the interface minimal; optional fields let
-    specific bodies (optical transfer matrix, HMC trajectory id, etc.)
-    attach modality-specific context without polluting the core.
-    """
-    # Identity
-    body_id: str                    # e.g. "optical-dodeca-01", "lattice-sim-0", "zvs-node-03"
-    body_type: str                  # "optical" | "lattice" | "wifi_csi" | "ultrasonic" | "zvs" | "sim"
-    excitation_id: Optional[int] = None   # sequential or hash of the stimulus
-
-    # The actual field state
+    body_id: str
+    body_type: str
+    excitation_id: Optional[int] = None
     field_regions: List[FieldRegion] = field(default_factory=list)
-
-    # Geometry / calibration status of the body itself
-    geometry_state: str = "unknown"  # "uncalibrated" | "calibrating" | "calibrated" | "degraded"
-
-    # Timing
+    geometry_state: str = "unknown"
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
-    # Optional modality-specific payload (kept opaque to MetaField core)
+    clock: Optional[ScarcityClock] = None
     modality: Dict[str, Any] = field(default_factory=dict)
+    health: str = "ok"
+    schema_version: int = 2
 
-    # Health of the observation itself
-    health: str = "ok"              # "ok" | "partial" | "stale" | "error"
-    schema_version: int = 1
+    def resolved_clock(self) -> ScarcityClock:
+        if self.clock is None:
+            return ScarcityClock.unanchored()
+        return self.clock if isinstance(self.clock, ScarcityClock) else parse_clock(self.clock)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +67,7 @@ class FieldObservation:
             "field_regions": [r.to_dict() for r in self.field_regions],
             "geometry_state": self.geometry_state,
             "timestamp": self.timestamp,
+            "clock": self.resolved_clock().to_dict(),
             "modality": self.modality or None,
             "health": self.health,
         }
@@ -97,102 +83,56 @@ class FieldObservation:
             )}) if isinstance(r, dict) else r
             for r in data.get("field_regions", [])
         ]
+        raw_clock = data.get("clock")
+        clock = parse_clock(raw_clock) if raw_clock is not None else ScarcityClock.unanchored()
         return cls(
             body_id=data["body_id"],
             body_type=data["body_type"],
             excitation_id=data.get("excitation_id"),
             field_regions=regions,
             geometry_state=data.get("geometry_state", "unknown"),
-            timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            timestamp=data.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+            clock=clock,
             modality=data.get("modality") or {},
             health=data.get("health", "ok"),
-            schema_version=data.get("schema_version", 1),
+            schema_version=data.get("schema_version", 2),
         )
 
 
-# ---------------------------------------------------------------------------
-# Convenience constructors
-# ---------------------------------------------------------------------------
-
-def lattice_observation(
-    body_id: str,
-    traj: int,
-    regions: List[FieldRegion],
-    geometry_state: str = "calibrated",
-    hmc_extras: Optional[Dict[str, Any]] = None,
-) -> FieldObservation:
-    """Helper for the existing lattice/HMC body."""
+def lattice_observation(body_id, traj, regions, geometry_state="calibrated", hmc_extras=None):
     return FieldObservation(
-        body_id=body_id,
-        body_type="lattice",
-        excitation_id=traj,
-        field_regions=regions,
-        geometry_state=geometry_state,
+        body_id=body_id, body_type="lattice", excitation_id=traj,
+        field_regions=regions, geometry_state=geometry_state,
         modality={"hmc": hmc_extras or {}},
     )
 
 
-def optical_observation(
-    body_id: str,
-    excitation_id: int,
-    regions: List[FieldRegion],
-    geometry_state: str = "uncalibrated",
-    transfer_matrix_hint: Optional[Dict[str, Any]] = None,
-) -> FieldObservation:
-    """Helper for the optical dodecahedral body (Phase 0+)."""
+def optical_observation(body_id, excitation_id, regions, geometry_state="uncalibrated", transfer_matrix_hint=None):
     return FieldObservation(
-        body_id=body_id,
-        body_type="optical",
-        excitation_id=excitation_id,
-        field_regions=regions,
-        geometry_state=geometry_state,
+        body_id=body_id, body_type="optical", excitation_id=excitation_id,
+        field_regions=regions, geometry_state=geometry_state,
         modality={"optical": transfer_matrix_hint or {}},
     )
 
 
-def ultrasonic_observation(
-    body_id: str,
-    excitation_id: Optional[int],
-    regions: List[FieldRegion],
-    geometry_state: str = "calibrated",
-    echo_extras: Optional[Dict[str, Any]] = None,
-) -> FieldObservation:
-    """Helper for Echo Grid / ultrasonic field body."""
+def ultrasonic_observation(body_id, excitation_id, regions, geometry_state="calibrated", echo_extras=None):
     return FieldObservation(
-        body_id=body_id,
-        body_type="ultrasonic",
-        excitation_id=excitation_id,
-        field_regions=regions,
-        geometry_state=geometry_state,
+        body_id=body_id, body_type="ultrasonic", excitation_id=excitation_id,
+        field_regions=regions, geometry_state=geometry_state,
         modality={"echo": echo_extras or {}},
     )
 
 
-def zvs_observation(
-    body_id: str,
-    excitation_id: Optional[int],
-    regions: List[FieldRegion],
-    geometry_state: str = "calibrated",
-    power_extras: Optional[Dict[str, Any]] = None,
-) -> FieldObservation:
-    """Helper for the ZVS resonant / HV power body."""
+def zvs_observation(body_id, excitation_id, regions, geometry_state="calibrated", power_extras=None):
     return FieldObservation(
-        body_id=body_id,
-        body_type="zvs",
-        excitation_id=excitation_id,
-        field_regions=regions,
-        geometry_state=geometry_state,
+        body_id=body_id, body_type="zvs", excitation_id=excitation_id,
+        field_regions=regions, geometry_state=geometry_state,
         modality={"zvs": power_extras or {}},
     )
 
 
-# ---------------------------------------------------------------------------
-# Minimal validation (fail-closed)
-# ---------------------------------------------------------------------------
-
-def validate_observation(obs: FieldObservation) -> List[str]:
-    """Return a list of problems; empty list means the observation is acceptable."""
-    problems: List[str] = []
+def validate_observation(obs: FieldObservation):
+    problems = []
     if not obs.body_id:
         problems.append("body_id is required")
     if obs.body_type not in ("optical", "lattice", "wifi_csi", "ultrasonic", "zvs", "sim", "other"):

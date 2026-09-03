@@ -41,7 +41,9 @@ python credit_mint.py --watch --interval 20
 | Control | Default |
 |---------|--------|
 | Live continuous owner | required (`METAFIELD_MINT_REQUIRE_CONTINUOUS=1`) |
-| Stats freshness | ≤ 120s (`METAFIELD_MINT_MAX_STATS_AGE`) |
+| Stats freshness | ≤ 120s mtime (`METAFIELD_MINT_MAX_STATS_AGE`) — writer liveness, not epoch |
+| Scarcity cooldown | anchored: `Δheight ≥ METAFIELD_MINT_COOLDOWN_BLOCKS` (default 1) |
+| Wall cooldown | unanchored anti-spam only (`METAFIELD_MINT_COOLDOWN_SEC`) |
 | Runtime dir | reject world-writable; optional `METAFIELD_STRICT_RUNTIME=1` |
 | Claim MAC | HMAC-SHA256(token, evidence_hash) |
 | Mint flock | exclusive `mint.lock` |
@@ -59,7 +61,8 @@ python credit_mint.py --watch --interval 20
 | `METAFIELD_MINT_MIN_TRAJ_DELTA` | 10 |
 | `METAFIELD_MINT_MIN_ACCEPT` | 0.35 |
 | `METAFIELD_MINT_MAX_ABS_DH` | 3.0 |
-| `METAFIELD_MINT_COOLDOWN_SEC` | 60 |
+| `METAFIELD_MINT_COOLDOWN_SEC` | 60 (unanchored only) |
+| `METAFIELD_MINT_COOLDOWN_BLOCKS` | 1 |
 | `METAFIELD_MINT_BASE_CREDIT` | 1.0 |
 | `METAFIELD_MINT_MAX_CREDIT` | 10 |
 | `METAFIELD_MINT_MAX_TOTAL` | 1e6 |

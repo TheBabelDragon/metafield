@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
 
+from schemas.scarcity_clock import ScarcityClock, parse_clock
+
 
 @dataclass
 class FieldMemoryEntry:
@@ -29,8 +31,8 @@ class FieldMemoryEntry:
     Links an observation back to an attractor and (optionally)
     a spatial / region key so MetaField can say:
 
-        “Yesterday, when this laser pattern occurred,
-         the field looked like this.”
+        “At this excitation, on this body, at this chain
+         position (or unanchored), the field looked like this.”
     """
     body_id: str
     excitation_id: Optional[int] = None
@@ -46,12 +48,19 @@ class FieldMemoryEntry:
 
     attractor_id: Optional[str] = None
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    clock: Optional[ScarcityClock] = None
 
     # Free-form context from the observation or from MetaField processing
     extras: Dict[str, Any] = field(default_factory=dict)
 
+    def resolved_clock(self) -> ScarcityClock:
+        if self.clock is None:
+            return ScarcityClock.unanchored()
+        return self.clock if isinstance(self.clock, ScarcityClock) else parse_clock(self.clock)
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        d["clock"] = self.resolved_clock().to_dict()
         if not d["extras"]:
             del d["extras"]
         return d
@@ -83,5 +92,6 @@ class FieldMemoryEntry:
             anomaly=max(anoms) if anoms else 0.0,
             attractor_id=attractor_id,
             timestamp=obs_dict.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+            clock=parse_clock(obs_dict.get("clock")),
             extras={"geometry_state": obs_dict.get("geometry_state")},
         )
