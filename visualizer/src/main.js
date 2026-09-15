@@ -1,7 +1,6 @@
 /**
  * MetaField Visualizer — entry point
- * Presentation / observation layer over the MetaField systems.
- * First version uses deterministic demo data only.
+ * DEMO / HEURISTIC only — not live MetaField or hardware.
  */
 import * as THREE from 'three';
 import { createScene } from './scene.js';
@@ -13,6 +12,10 @@ import { generateDemoSequence } from './demo-data.js';
 import { normalizeObservation } from './adapter.js';
 
 const container = document.getElementById('canvas-container');
+if (!container) {
+  throw new Error('Missing #canvas-container');
+}
+
 const ctx = createScene(container);
 const body = createFieldBody(ctx.scene);
 const field = createFieldLayer(ctx.scene, body);
@@ -61,7 +64,6 @@ function updateHUD(obs) {
 
   el.tick.textContent = String(obs.tick);
   el.mode.textContent = (obs.phase || 'idle').toUpperCase();
-  el.mode.className = 'value accent';
 
   if (obs.probe) {
     el.probe.textContent = `face ${obs.probe.face}`;
@@ -71,11 +73,9 @@ function updateHUD(obs) {
     el.wave.textContent = '—';
   }
 
-  if (obs.prediction) {
-    el.pred.textContent = `f${obs.prediction.face} = ${fmt(obs.prediction.value)}`;
-  } else {
-    el.pred.textContent = '—';
-  }
+  el.pred.textContent = obs.prediction
+    ? `f${obs.prediction.face} = ${fmt(obs.prediction.value)}`
+    : '—';
 
   const activeObs = obs.probe
     ? obs.observations.find((o) => o.face === obs.probe.face)
@@ -88,17 +88,13 @@ function updateHUD(obs) {
     el.conf.textContent = '—';
   }
 
-  if (obs.error) {
-    el.err.textContent = `f${obs.error.face} = ${fmt(obs.error.value)}`;
-  } else {
-    el.err.textContent = '—';
-  }
+  el.err.textContent = obs.error
+    ? `f${obs.error.face} = ${fmt(obs.error.value)}`
+    : '—';
 
-  if (obs.nextProbe) {
-    el.next.textContent = `face ${obs.nextProbe.face} (DEMO)`;
-  } else {
-    el.next.textContent = '—';
-  }
+  el.next.textContent = obs.nextProbe
+    ? `face ${obs.nextProbe.face} (DEMO)`
+    : '—';
 
   el.source.textContent = obs._demo ? 'DEMO / HEURISTIC' : 'LIVE';
 }
@@ -122,7 +118,7 @@ const timeline = createTimeline({
   },
   onIndexChange(index, total) {
     el.timeline.max = Math.max(0, total - 1);
-    el.timeline.value = index;
+    el.timeline.value = String(index);
     el.tlMin.textContent = '0';
     el.tlMax.textContent = String(Math.max(0, total - 1));
     el.tlCur.textContent = total ? `tick ${index} / ${total - 1}` : 'history';
@@ -132,37 +128,41 @@ const timeline = createTimeline({
 const sequence = generateDemoSequence(60, 42);
 timeline.load(sequence);
 
-el.timeline.addEventListener('input', () => {
+function on(node, event, fn) {
+  if (node) node.addEventListener(event, fn);
+}
+
+on(el.timeline, 'input', () => {
   timeline.pause();
-  el.btnDemo.classList.remove('active');
+  el.btnDemo?.classList.remove('active');
   timeline.setIndex(Number(el.timeline.value));
 });
 
-el.btnDemo.addEventListener('click', () => {
-  const on = !timeline.isDemo();
-  timeline.toggleDemo(on);
-  el.btnDemo.classList.toggle('active', on);
-  if (on) body.setAutoRotate(true);
+on(el.btnDemo, 'click', () => {
+  const onDemo = !timeline.isDemo();
+  timeline.toggleDemo(onDemo);
+  el.btnDemo.classList.toggle('active', onDemo);
+  if (onDemo) body.setAutoRotate(true);
 });
 
-el.btnPlay.addEventListener('click', () => {
+on(el.btnPlay, 'click', () => {
   timeline.play();
-  el.btnDemo.classList.remove('active');
+  el.btnDemo?.classList.remove('active');
 });
 
-el.btnPause.addEventListener('click', () => {
+on(el.btnPause, 'click', () => {
   timeline.pause();
-  el.btnDemo.classList.remove('active');
+  el.btnDemo?.classList.remove('active');
 });
 
-el.btnReset.addEventListener('click', () => {
+on(el.btnReset, 'click', () => {
   timeline.reset();
   probes.clearProbe();
-  el.btnDemo.classList.remove('active');
+  el.btnDemo?.classList.remove('active');
   body.setAutoRotate(true);
 });
 
-el.btnProbe.addEventListener('click', () => {
+on(el.btnProbe, 'click', () => {
   const face = body.state.selectedFace ?? 0;
   probes.triggerProbe(face, 1.0, 850);
   body.setSelectedFace(face);
@@ -182,7 +182,7 @@ el.btnProbe.addEventListener('click', () => {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 
-function onPointerDown(event) {
+ctx.domElement.addEventListener('pointerdown', (event) => {
   const rect = ctx.domElement.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
@@ -196,8 +196,7 @@ function onPointerDown(event) {
       if (raw) applyFrame(raw);
     }
   }
-}
-ctx.domElement.addEventListener('pointerdown', onPointerDown);
+});
 
 ctx.addUpdatable((dt, t) => {
   body.update(dt);
@@ -207,7 +206,9 @@ ctx.addUpdatable((dt, t) => {
 });
 
 applyFrame(sequence[0]);
+timeline.toggleDemo(true);
+el.btnDemo?.classList.add('active');
 
 console.info(
-  '[MetaField Visualizer] DEMO / HEURISTIC mode. Data from demo-data.js — not live MetaField predictor or optical hardware.'
+  '[MetaField Visualizer] DEMO / HEURISTIC mode — not live MetaField or optical hardware.'
 );
