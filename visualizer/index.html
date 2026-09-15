@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MetaField Visualizer</title>
+  <style>
+    :root {
+      --bg: #05070c;
+      --panel: rgba(8, 12, 20, 0.82);
+      --border: rgba(80, 140, 220, 0.25);
+      --text: #c8d8f0;
+      --muted: #6a809a;
+      --accent: #3aa0ff;
+      --warn: #ff6b4a;
+      --ok: #3dd68c;
+      --pred: #a78bfa;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+      font-size: 12px;
+      user-select: none;
+    }
+    #canvas-container {
+      position: fixed;
+      inset: 0;
+    }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 10;
+    }
+    .panel {
+      pointer-events: auto;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+    #status {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      min-width: 220px;
+      max-width: 280px;
+    }
+    #status h1 {
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    #status .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 3px 0;
+      line-height: 1.4;
+    }
+    #status .label { color: var(--muted); }
+    #status .value { color: var(--text); text-align: right; }
+    #status .value.accent { color: var(--accent); }
+    #status .value.warn { color: var(--warn); }
+    #status .value.ok { color: var(--ok); }
+    #status .value.pred { color: var(--pred); }
+    #controls {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
+      max-width: 96vw;
+    }
+    button, .btn {
+      pointer-events: auto;
+      background: rgba(20, 30, 48, 0.9);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    button:hover, .btn:hover {
+      border-color: var(--accent);
+      background: rgba(30, 50, 80, 0.95);
+    }
+    button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: 0 0 12px rgba(58, 160, 255, 0.25);
+    }
+    #timeline-wrap {
+      position: absolute;
+      bottom: 60px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: min(520px, 90vw);
+      pointer-events: auto;
+    }
+    #timeline {
+      width: 100%;
+      accent-color: var(--accent);
+      height: 4px;
+      cursor: pointer;
+    }
+    #timeline-label {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 10px;
+      margin-top: 4px;
+    }
+    #hint {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      max-width: 200px;
+      text-align: right;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.5;
+    }
+    #legend {
+      position: absolute;
+      bottom: 16px;
+      right: 12px;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+    .swatch {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    @media (max-width: 600px) {
+      #status { min-width: 160px; font-size: 11px; }
+      #hint { display: none; }
+      #legend { bottom: 70px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="hud">
+    <div id="status" class="panel">
+      <h1>MetaField Instrument</h1>
+      <div class="row"><span class="label">tick</span><span class="value" id="v-tick">—</span></div>
+      <div class="row"><span class="label">mode</span><span class="value accent" id="v-mode">IDLE</span></div>
+      <div class="row"><span class="label">active probe</span><span class="value" id="v-probe">—</span></div>
+      <div class="row"><span class="label">wavelength</span><span class="value" id="v-wave">—</span></div>
+      <div class="row"><span class="label">prediction</span><span class="value pred" id="v-pred">—</span></div>
+      <div class="row"><span class="label">observation</span><span class="value" id="v-obs">—</span></div>
+      <div class="row"><span class="label">error</span><span class="value warn" id="v-err">—</span></div>
+      <div class="row"><span class="label">confidence</span><span class="value ok" id="v-conf">—</span></div>
+      <div class="row"><span class="label">next probe</span><span class="value accent" id="v-next">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="label">source</span><span class="value" id="v-source">DEMO / HEURISTIC</span></div>
+    </div>
+    <div id="hint">
+      drag to orbit · scroll to zoom<br>
+      click face to select · DEMO cycles the loop
+    </div>
+    <div id="legend" class="panel">
+      <div><span class="swatch" style="background:#3aa0ff"></span>active / selected</div>
+      <div><span class="swatch" style="background:#a78bfa"></span>prediction</div>
+      <div><span class="swatch" style="background:#3dd68c"></span>observation</div>
+      <div><span class="swatch" style="background:#ff6b4a"></span>anomaly / error</div>
+      <div><span class="swatch" style="background:#1a3a5c"></span>field magnitude</div>
+    </div>
+    <div id="timeline-wrap">
+      <input type="range" id="timeline" min="0" max="0" value="0" step="1" />
+      <div id="timeline-label">
+        <span id="tl-min">0</span>
+        <span id="tl-cur">history</span>
+        <span id="tl-max">0</span>
+      </div>
+    </div>
+    <div id="controls">
+      <button id="btn-demo">DEMO</button>
+      <button id="btn-play">PLAY</button>
+      <button id="btn-pause">PAUSE</button>
+      <button id="btn-probe">PROBE SELECTED</button>
+      <button id="btn-reset">RESET</button>
+    </div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
