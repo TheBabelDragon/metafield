@@ -2,176 +2,123 @@ import * as THREE from 'three';
 import { NUM_FACES } from './demo-data.js';
 
 /**
- * Dodecahedral field body with addressable faces.
- * Face IDs 0..11 are stable and map 1:1 to MetaField optical-body cells.
+ * Dodecahedral field body with 12 addressable faces (IDs 0..11).
  */
 
-function createDodecahedronGeometry(radius = 1.35) {
-  const geo = new THREE.DodecahedronGeometry(radius, 0);
+const PHI = (1 + Math.sqrt(5)) / 2;
+const INV_PHI = 1 / PHI;
+
+function dodecahedronFaceNormals() {
+  const normals = [];
+  const bases = [
+    [0, INV_PHI, PHI],
+    [0, -INV_PHI, PHI],
+    [0, INV_PHI, -PHI],
+    [0, -INV_PHI, -PHI],
+    [PHI, 0, INV_PHI],
+    [-PHI, 0, INV_PHI],
+    [PHI, 0, -INV_PHI],
+    [-PHI, 0, -INV_PHI],
+    [INV_PHI, PHI, 0],
+    [-INV_PHI, PHI, 0],
+    [INV_PHI, -PHI, 0],
+    [-INV_PHI, -PHI, 0],
+  ];
+  for (const b of bases) {
+    normals.push(new THREE.Vector3(b[0], b[1], b[2]).normalize());
+  }
+  return normals;
+}
+
+function makePentagonGeometry(radius) {
+  const verts = [];
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2 - Math.PI / 2;
+    verts.push(new THREE.Vector3(Math.cos(a) * radius, Math.sin(a) * radius, 0));
+  }
+  const positions = [0, 0, 0];
+  for (const v of verts) positions.push(v.x, v.y, v.z);
+  const indices = [];
+  for (let i = 0; i < 5; i++) {
+    indices.push(0, i + 1, ((i + 1) % 5) + 1);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
   return geo;
 }
 
-/**
- * Build a mesh group where each of the 12 faces is a selectable Mesh.
- */
 export function createFieldBody(scene) {
   const group = new THREE.Group();
   group.name = 'fieldBody';
+  const radius = 1.35;
 
-  const shellGeo = new THREE.DodecahedronGeometry(1.36, 0);
-  const shellMat = new THREE.MeshBasicMaterial({
-    color: 0x1a3050,
-    wireframe: true,
-    transparent: true,
-    opacity: 0.55,
-  });
-  const shell = new THREE.Mesh(shellGeo, shellMat);
+  const shellGeo = new THREE.DodecahedronGeometry(radius, 0);
+  const shell = new THREE.Mesh(
+    shellGeo,
+    new THREE.MeshBasicMaterial({
+      color: 0x3a6aaa,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.7,
+    })
+  );
   group.add(shell);
 
-  const bodyMat = new THREE.MeshPhysicalMaterial({
-    color: 0x0a1525,
-    metalness: 0.15,
-    roughness: 0.55,
-    transparent: true,
-    opacity: 0.35,
-    side: THREE.DoubleSide,
-    transmission: 0.15,
-    thickness: 0.6,
-  });
-  const bodyMesh = new THREE.Mesh(shellGeo.clone(), bodyMat);
-  group.add(bodyMesh);
+  const core = new THREE.Mesh(
+    shellGeo.clone(),
+    new THREE.MeshStandardMaterial({
+      color: 0x0c1a30,
+      metalness: 0.3,
+      roughness: 0.55,
+      transparent: true,
+      opacity: 0.45,
+      side: THREE.DoubleSide,
+    })
+  );
+  group.add(core);
 
+  const normals = dodecahedronFaceNormals();
   const faceMeshes = [];
   const faceCenters = [];
   const faceNormals = [];
+  const panelRadius = 0.55;
 
-  const pos = shellGeo.attributes.position;
-  const index = shellGeo.index;
+  for (let faceId = 0; faceId < NUM_FACES; faceId++) {
+    const normal = normals[faceId];
+    const center = normal.clone().multiplyScalar(radius * 0.92);
 
-  const tmpA = new THREE.Vector3();
-  const tmpB = new THREE.Vector3();
-  const tmpC = new THREE.Vector3();
-  const tmpN = new THREE.Vector3();
-  const tmpCentroid = new THREE.Vector3();
-
-  const buckets = new Map();
-  const normalKey = (n) =>
-    `${n.x.toFixed(4)},${n.y.toFixed(4)},${n.z.toFixed(4)}`;
-
-  for (let i = 0; i < index.count; i += 3) {
-    const ia = index.getX(i);
-    const ib = index.getX(i + 1);
-    const ic = index.getX(i + 2);
-    tmpA.fromBufferAttribute(pos, ia);
-    tmpB.fromBufferAttribute(pos, ib);
-    tmpC.fromBufferAttribute(pos, ic);
-    tmpN.subVectors(tmpB, tmpA).cross(tmpC.clone().sub(tmpA)).normalize();
-    const key = normalKey(tmpN);
-    if (!buckets.has(key)) {
-      buckets.set(key, {
-        normal: tmpN.clone(),
-        vertices: [],
-        indices: [],
-      });
-    }
-    const b = buckets.get(key);
-    b.vertices.push(tmpA.clone(), tmpB.clone(), tmpC.clone());
-    b.indices.push(ia, ib, ic);
-  }
-
-  let faceId = 0;
-  for (const [, bucket] of buckets) {
-    if (faceId >= NUM_FACES) break;
-
-    tmpCentroid.set(0, 0, 0);
-    for (const v of bucket.vertices) tmpCentroid.add(v);
-    tmpCentroid.divideScalar(bucket.vertices.length);
-
-    const ring = [];
-    const seen = new Set();
-    for (const v of bucket.vertices) {
-      const k = `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
-      if (!seen.has(k)) {
-        seen.add(k);
-        ring.push(v.clone().addScaledVector(bucket.normal, 0.025));
-      }
-    }
-    const origin = tmpCentroid.clone().addScaledVector(bucket.normal, 0.025);
-    const ref = new THREE.Vector3();
-    if (Math.abs(bucket.normal.y) < 0.9) ref.set(0, 1, 0);
-    else ref.set(1, 0, 0);
-    const tangent = new THREE.Vector3().crossVectors(bucket.normal, ref).normalize();
-    const bitangent = new THREE.Vector3().crossVectors(bucket.normal, tangent).normalize();
-    ring.sort((a, b) => {
-      const va = a.clone().sub(origin);
-      const vb = b.clone().sub(origin);
-      const angA = Math.atan2(va.dot(bitangent), va.dot(tangent));
-      const angB = Math.atan2(vb.dot(bitangent), vb.dot(tangent));
-      return angA - angB;
-    });
-
-    const panelPositions = [];
-    const panelIndices = [];
-    panelPositions.push(origin.x, origin.y, origin.z);
-    for (const v of ring) {
-      panelPositions.push(v.x, v.y, v.z);
-    }
-    for (let i = 0; i < ring.length; i++) {
-      const a = 0;
-      const b = i + 1;
-      const c = ((i + 1) % ring.length) + 1;
-      panelIndices.push(a, b, c);
-    }
-
-    const pGeo = new THREE.BufferGeometry();
-    pGeo.setAttribute(
-      'position',
-      new THREE.Float32BufferAttribute(panelPositions, 3)
-    );
-    pGeo.setIndex(panelIndices);
-    pGeo.computeVertexNormals();
-
-    const baseColor = new THREE.Color(0x122033);
+    const geo = makePentagonGeometry(panelRadius);
     const mat = new THREE.MeshStandardMaterial({
-      color: baseColor.clone(),
-      emissive: new THREE.Color(0x000000),
-      metalness: 0.2,
-      roughness: 0.45,
+      color: new THREE.Color(0x1a3a5c),
+      emissive: new THREE.Color(0x102030),
+      emissiveIntensity: 0.35,
+      metalness: 0.15,
+      roughness: 0.4,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.92,
       side: THREE.DoubleSide,
     });
 
-    const mesh = new THREE.Mesh(pGeo, mat);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(center);
+    mesh.lookAt(center.clone().add(normal));
     mesh.userData.faceId = faceId;
-    mesh.userData.baseColor = baseColor.clone();
+    mesh.userData.baseColor = new THREE.Color(0x1a3a5c);
     mesh.name = `face_${faceId}`;
     group.add(mesh);
+
     faceMeshes.push(mesh);
-    faceCenters.push(origin.clone());
-    faceNormals.push(bucket.normal.clone());
+    faceCenters.push(center.clone());
+    faceNormals.push(normal.clone());
 
-    const markerGeo = new THREE.SphereGeometry(0.035, 8, 8);
-    const markerMat = new THREE.MeshBasicMaterial({
-      color: 0x3aa0ff,
-      transparent: true,
-      opacity: 0.7,
-    });
-    const marker = new THREE.Mesh(markerGeo, markerMat);
-    marker.position.copy(origin).addScaledVector(bucket.normal, 0.06);
-    marker.userData.faceId = faceId;
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.04, 10, 10),
+      new THREE.MeshBasicMaterial({ color: 0x5ab0ff })
+    );
+    marker.position.copy(center).addScaledVector(normal, 0.08);
     group.add(marker);
-
-    faceId++;
-  }
-
-  while (faceMeshes.length < NUM_FACES) {
-    const i = faceMeshes.length;
-    const phi = (i / NUM_FACES) * Math.PI * 2;
-    const c = new THREE.Vector3(Math.cos(phi), Math.sin(phi) * 0.3, Math.sin(phi)).normalize().multiplyScalar(1.2);
-    faceCenters.push(c);
-    faceNormals.push(c.clone().normalize());
-    faceMeshes.push(null);
   }
 
   scene.add(group);
@@ -188,30 +135,38 @@ export function createFieldBody(scene) {
     const mesh = faceMeshes[faceId];
     if (!mesh) return;
 
-    const base = mesh.userData.baseColor;
-    const color = base.clone();
-
     const v = value ?? state.values[faceId] ?? 0;
-    color.lerp(new THREE.Color(0x1a6aaa), THREE.MathUtils.clamp(v, 0, 1));
-
     const a = anomaly ?? state.anomaly[faceId] ?? 0;
-    if (a > 0.05) {
-      color.lerp(new THREE.Color(0xff6b4a), THREE.MathUtils.clamp(a, 0, 1));
-    }
+    const conf = confidence ?? state.confidence[faceId] ?? 0.5;
 
+    const color = new THREE.Color(0x0a1525).lerp(new THREE.Color(0x2a90ff), THREE.MathUtils.clamp(v, 0, 1));
+    if (a > 0.05) {
+      color.lerp(new THREE.Color(0xff5533), THREE.MathUtils.clamp(a * 1.2, 0, 1));
+    }
     mesh.material.color.copy(color);
 
-    let em = 0x000000;
-    if (highlight) em = 0x3aa0ff;
-    if (pred) em = 0x6b4dff;
-    if (observed) em = 0x2ecc7a;
-    if (a > 0.25) em = 0xff4422;
-
-    mesh.material.emissive = new THREE.Color(em);
-    mesh.material.emissiveIntensity = highlight || pred || observed || a > 0.2 ? 0.55 : 0.08;
-
-    const conf = confidence ?? state.confidence[faceId] ?? 0.5;
-    mesh.material.opacity = 0.55 + conf * 0.4;
+    let emColor = 0x102030;
+    let emIntensity = 0.25 + v * 0.4;
+    if (highlight) {
+      emColor = 0x3aa0ff;
+      emIntensity = 0.85;
+    }
+    if (pred) {
+      emColor = 0x9b6bff;
+      emIntensity = 0.9;
+    }
+    if (observed) {
+      emColor = 0x2ecc7a;
+      emIntensity = 0.9;
+    }
+    if (a > 0.25) {
+      emColor = 0xff4422;
+      emIntensity = 1.0;
+    }
+    mesh.material.emissive = new THREE.Color(emColor);
+    mesh.material.emissiveIntensity = emIntensity;
+    mesh.material.opacity = 0.7 + conf * 0.28;
+    mesh.scale.setScalar(1 + v * 0.12);
   }
 
   function applyObservation(obs) {
@@ -233,7 +188,7 @@ export function createFieldBody(scene) {
         confidence: state.confidence[f],
         anomaly: isErr ? Math.max(state.anomaly[f], obs.error.value) : state.anomaly[f],
         highlight: isProbe || isSelected,
-        pred: isPred && obs.phase === 'predict',
+        pred: isPred && (obs.phase === 'predict' || obs.phase === 'compare'),
         observed: isProbe && (obs.phase === 'observe' || obs.phase === 'compare'),
       });
     }
@@ -243,24 +198,12 @@ export function createFieldBody(scene) {
     state.selectedFace = id;
   }
 
-  function getFaceWorldCenter(faceId) {
-    const local = faceCenters[faceId];
-    if (!local) return new THREE.Vector3();
-    return local.clone().applyMatrix4(group.matrixWorld);
-  }
-
-  function getFaceNormal(faceId) {
-    return faceNormals[faceId]?.clone() ?? new THREE.Vector3(0, 1, 0);
-  }
-
   function getPickables() {
     return faceMeshes.filter(Boolean);
   }
 
   function update(dt) {
-    if (autoRotate) {
-      group.rotation.y += dt * 0.08;
-    }
+    if (autoRotate) group.rotation.y += dt * 0.12;
   }
 
   return {
@@ -271,8 +214,14 @@ export function createFieldBody(scene) {
     state,
     applyObservation,
     setSelectedFace,
-    getFaceWorldCenter,
-    getFaceNormal,
+    getFaceWorldCenter(faceId) {
+      const local = faceCenters[faceId];
+      if (!local) return new THREE.Vector3();
+      return local.clone().applyMatrix4(group.matrixWorld);
+    },
+    getFaceNormal(faceId) {
+      return faceNormals[faceId]?.clone() ?? new THREE.Vector3(0, 1, 0);
+    },
     getPickables,
     update,
     setAutoRotate(v) {
