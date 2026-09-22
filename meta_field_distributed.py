@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-meta_field_distributed.py v1.60
+meta_field_distributed.py v1.61
 
 Bootstrap: fetch known-good HMC body (commit 4588681), apply patches, run.
-Caches to .meta_field_distributed.v160.py — offline after first run.
+Caches to .meta_field_distributed.v161.py — offline after first run.
+
+v1.61: reject --world-size < 1 (was causing numel overflow via negative local_L).
 See HMC_TUNING.md.
 """
 from __future__ import annotations
@@ -17,175 +19,115 @@ _GOOD_URL = (
     "https://raw.githubusercontent.com/TheBabelDragon/metafield/"
     "458868180717aa684fd34a9c5a71d391a25dd625/meta_field_distributed.py"
 )
-_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v160.py"
+_CACHE = pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v161.py"
+_OLD_CACHES = (
+    pathlib.Path(__file__).resolve().parent / ".meta_field_distributed.v160.py",
+)
 
 
 def _patch(src: str) -> str:
-    src = src.replace('VERSION = "1.58"', 'VERSION = "1.60"', 1)
+    src = src.replace('VERSION = "1.58"', 'VERSION = "1.61"', 1)
     src = src.replace(
         "meta_field_distributed.py v1.58\n\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
-        "meta_field_distributed.py v1.60\n\n"
-        "Single-machine first. HMC step 5e-5 × 300 leapfrog. See HMC_TUNING.md.\n"
+        "meta_field_distributed.py v1.61\n\n"
+        "Single-machine first. Reject world_size < 1 (prevents numel overflow).\n"
+        "HMC step 5e-5 × 300 leapfrog. See HMC_TUNING.md.\n"
         "Nightcap: HMC throughput + geometry-aware episodic interestingness.",
         1,
     )
     src = src.replace(
         'p.add_argument("--world-size", type=int, default=2)',
         'p.add_argument("--world-size", type=int, default=1, metavar="N",\n'
-        '                    help="process count (default: 1 local). "\n'
+        '                    help="process count (default: 1 local). Must be >= 1. "\n'
         '                         "Use N>1 only with torchrun / RANK+WORLD_SIZE set.")',
         1,
     )
-    old_init = '''def init_distributed(args):
-    role = args.role
-    world_size = args.world_size
-    if role == "control":
-        rank = 0
-    elif role == "worker":
-        rank = args.rank if args.rank is not None else 1
-    else:
-        rank = args.rank if args.rank is not None else int(os.environ.get("RANK", 0))
 
-    master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
-
-    if world_size > 1:
-        if master_addr.startswith("127."):
-            print("\\n[CRITICAL ERROR] Resolving to localhost. Fix /etc/hosts.")
-            sys.exit(1)
-        print(f"[Distributed] Initializing... rank={rank} world_size={world_size} master={master_addr}")
-        try:
-            dist.init_process_group(backend=args.backend, init_method="env://", rank=rank, world_size=world_size)
-            print("[Distributed] OK")
-        except Exception as e:
-            print(f"[Distributed] Failed: {e}")
-            sys.exit(1)
-
-    print_banner(rank, world_size, role, args.diagnostic)
-    return rank, world_size, master_addr, args.master_port'''
-    new_init = '''def init_distributed(args):
-    role = args.role
-    world_size = args.world_size
-
-    env_world = os.environ.get("WORLD_SIZE")
-    env_rank = os.environ.get("RANK")
-    if env_world is not None:
-        try:
-            world_size = int(env_world)
-        except ValueError:
-            pass
-
-    if role == "control":
-        rank = 0
-    elif role == "worker":
-        rank = args.rank if args.rank is not None else 1
-    else:
-        if args.rank is not None:
-            rank = args.rank
-        elif env_rank is not None:
-            rank = int(env_rank)
-        else:
-            rank = 0
-
-    master_addr = args.master_addr if args.master_addr != "auto" else get_real_lan_ip()
-
-    launched = env_world is not None or env_rank is not None
-    if world_size > 1 and not launched and args.rank is None and role == "auto":
-        print(
-            f"[Distributed] world-size={world_size} requested but no RANK/WORLD_SIZE env "
-            f"(not under torchrun). Falling back to world-size=1 for local run."
+    if "invalid --world-size=" not in src:
+        marker = "def init_distributed(args):\n    role = args.role\n    world_size = args.world_size\n"
+        insert = (
+            "def init_distributed(args):\n"
+            "    role = args.role\n"
+            "    world_size = args.world_size\n"
+            "    if world_size < 1:\n"
+            "        print(\n"
+            "            f\"[Distributed] invalid --world-size={world_size}. \"\n"
+            "            f\"Must be >= 1 (use 1 for a single local process).\"\n"
+            "        )\n"
+            "        print(\"  Example: python meta_field_distributed.py --diagnostic --continuous\")\n"
+            "        sys.exit(2)\n"
         )
-        print("  Tip: for real multi-rank use: torchrun --nproc_per_node=2 meta_field_distributed.py ...")
-        world_size = 1
-        rank = 0
+        if marker in src:
+            src = src.replace(marker, insert, 1)
 
-    if world_size > 1:
-        if master_addr.startswith("127."):
-            print("\\n[CRITICAL ERROR] master addr resolved to localhost.")
-            print("  Fix /etc/hosts hostname mapping, or pass --master-addr <LAN-IP>.")
-            sys.exit(1)
-        os.environ.setdefault("MASTER_ADDR", master_addr)
-        os.environ.setdefault("MASTER_PORT", str(args.master_port))
-        os.environ.setdefault("RANK", str(rank))
-        os.environ.setdefault("WORLD_SIZE", str(world_size))
-        print(f"[Distributed] Initializing... rank={rank} world_size={world_size} master={master_addr}")
-        try:
-            dist.init_process_group(
-                backend=args.backend,
-                init_method="env://",
-                rank=rank,
-                world_size=world_size,
-            )
-            print("[Distributed] OK")
-        except Exception as e:
-            print(f"[Distributed] Failed: {e}")
-            print("  For a single machine just omit --world-size (defaults to 1).")
-            sys.exit(1)
+    old_check = (
+        "        if self.L % world_size != 0:\n"
+        "            raise ValueError(\n"
+        "                f\"Lattice size L={self.L} must be divisible by world_size={world_size}. \"\n"
+        "                f\"Choose L that divides evenly (e.g. L=4 with world_size=1 or 2).\"\n"
+        "            )\n"
+        "        self.local_L = self.L // world_size\n"
+    )
+    new_check = (
+        "        if world_size < 1:\n"
+        "            raise ValueError(\n"
+        "                f\"world_size must be >= 1, got {world_size}. \"\n"
+        "                f\"For a local single process use --world-size 1 (or omit it).\"\n"
+        "            )\n"
+        "        if self.L < 1:\n"
+        "            raise ValueError(f\"Lattice size L must be >= 1, got {self.L}.\")\n"
+        "        if self.L % world_size != 0:\n"
+        "            raise ValueError(\n"
+        "                f\"Lattice size L={self.L} must be divisible by world_size={world_size}. \"\n"
+        "                f\"Choose L that divides evenly (e.g. L=4 with world_size=1 or 2).\"\n"
+        "            )\n"
+        "        self.local_L = self.L // world_size\n"
+        "        if self.local_L < 1:\n"
+        "            raise ValueError(\n"
+        "                f\"local_L={self.local_L} is invalid (L={self.L}, world_size={world_size}).\"\n"
+        "            )\n"
+    )
+    if old_check in src and "world_size must be >= 1" not in src:
+        src = src.replace(old_check, new_check, 1)
 
-    print_banner(rank, world_size, role, args.diagnostic)
-    return rank, world_size, master_addr, args.master_port'''
-    if old_init in src:
-        src = src.replace(old_init, new_init, 1)
-    src = src.replace(
-        "    # Nightcap defaults: slightly smaller step for ~50% accept, keep τ useful\n"
-        "    if args.include_fermions:\n"
-        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 75\n"
-        "        step_size = args.hmc_step if args.hmc_step is not None else 0.0002\n"
-        "    else:\n"
-        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20\n"
-        "        step_size = args.hmc_step if args.hmc_step is not None else 0.012",
-        "    # Dynamical defaults (HMC_TUNING.md). 5e-5×300 keeps τ≈0.015.\n"
-        "    if args.include_fermions:\n"
-        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 300\n"
-        "        step_size = args.hmc_step if args.hmc_step is not None else 5e-5\n"
-        "    else:\n"
-        "        leapfrog = args.hmc_leapfrog if args.hmc_leapfrog is not None else 20\n"
-        "        step_size = args.hmc_step if args.hmc_step is not None else 0.012",
-        1,
+    old_eye = (
+        "        shape = lattice.local_padded_shape + (4, config.color_dim, config.color_dim)\n"
+        "        eye = torch.eye(config.color_dim, dtype=config.dtype, device=lattice.device).expand(shape).clone()"
     )
-    src = src.replace(
-        "        if config.include_fermions:\n"
-        "            print(f\"  CG tol_md={config.cg_tol_md}  tol_action={config.cg_tol_action}\")\n"
-        "        print()",
-        "        if config.include_fermions:\n"
-        "            print(f\"  CG tol_md={config.cg_tol_md}  tol_action={config.cg_tol_action}\")\n"
-        "            print(\"  Target: |ΔH| ≲ 1 and accept ~0.5–0.7  "
-        "(override with --hmc-step / --hmc-leapfrog)\")\n"
-        "        print()",
-        1,
+    new_eye = (
+        "        shape = lattice.local_padded_shape + (4, config.color_dim, config.color_dim)\n"
+        "        if any(int(d) < 1 for d in shape):\n"
+        "            raise ValueError(\n"
+        "                f\"Gauge field shape has non-positive dim: {shape}. \"\n"
+        "                f\"Check --world-size (>=1) and lattice L.\"\n"
+        "            )\n"
+        "        try:\n"
+        "            eye = torch.eye(config.color_dim, dtype=config.dtype, device=lattice.device).expand(shape).clone()\n"
+        "        except RuntimeError as exc:\n"
+        "            raise RuntimeError(\n"
+        "                f\"Failed to allocate gauge field with shape={shape} \"\n"
+        "                f\"(local_padded={lattice.local_padded_shape}, color_dim={config.color_dim}). \"\n"
+        "                f\"Original: {exc}\"\n"
+        "            ) from exc"
     )
-    needle = (
-        '                print(f"traj {t:02d} | dH={dh_s} | {status} '
-        "(rate={res['acceptance_rate']:.2f}){extra}\")\n\n"
-        "    except KeyboardInterrupt:"
-    )
-    insert = (
-        '                print(f"traj {t:02d} | dH={dh_s} | {status} '
-        "(rate={res['acceptance_rate']:.2f}){extra}\")\n\n"
-        "                if args.diagnostic and t == 14 and hmc.n_total >= 15:\n"
-        "                    recent = [d for d in hmc.delta_h_history[-15:] if math.isfinite(d)]\n"
-        "                    mean_abs = sum(abs(d) for d in recent) / max(1, len(recent))\n"
-        "                    rate = res[\"acceptance_rate\"]\n"
-        "                    if rate < 0.35 or mean_abs > 1.5:\n"
-        "                        sug_step = step_size * 0.5\n"
-        "                        sug_lf = max(leapfrog * 2, leapfrog + 1)\n"
-        "                        print(\n"
-        "                            f\"  [HMC tune] mean|ΔH|≈{mean_abs:.2f} accept={rate:.2f} — \"\n"
-        "                            f\"try --hmc-step {sug_step:.6g} --hmc-leapfrog {sug_lf} \"\n"
-        "                            f\"(see HMC_TUNING.md)\"\n"
-        "                        )\n\n"
-        "    except KeyboardInterrupt:"
-    )
-    if needle in src:
-        src = src.replace(needle, insert, 1)
+    if old_eye in src:
+        src = src.replace(old_eye, new_eye, 1)
+
     return src
 
 
 def _ensure_impl() -> pathlib.Path:
-    if _CACHE.exists() and b'VERSION = "1.60"' in _CACHE.read_bytes():
+    if _CACHE.exists() and b'VERSION = "1.61"' in _CACHE.read_bytes():
         return _CACHE
-    print("[boot] fetching known-good body + applying v1.60 patches…")
-    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v160-bootstrap"})
+    for old in _OLD_CACHES:
+        if old.exists():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    print("[boot] fetching known-good body + applying v1.61 patches…")
+    req = urllib.request.Request(_GOOD_URL, headers={"User-Agent": "metafield-v161-bootstrap"})
     raw = urllib.request.urlopen(req, timeout=60).read().decode()
     patched = _patch(raw)
     _CACHE.write_text(patched)
