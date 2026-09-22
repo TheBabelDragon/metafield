@@ -123,4 +123,30 @@ MIT License
 
 ---
 
+## WaveBridge integration
+
+MetaField talks to physical waveforms through a thin adapter
+(`wavebridge_adapter.py`) so WaveBridge never learns MetaField
+internals and MetaField never embeds transport logic.
+
+```
+MetaField state
+      ↓  wavebridge_adapter.field_state_to_wavebridge
+WaveBridge packet / waveform
+      ↓  physical substrate (sim | audio | optical)
+observation
+      ↓  wavebridge_adapter.wavebridge_observation_to_field
+FieldMemoryStore → geometry / predictor / active_probe
+```
+
+Synthetic end-to-end test (no hardware):
+
+```bash
+PYTHONPATH=../wavebridge:. python -m pytest tests/test_wavebridge_adapter.py tests/test_wavebridge_integration.py -q
+```
+
+See also `optical_wavebridge_hook.py` for the optical-body wiring point.
+
+---
+
 *Actively evolving toward a distributed physics-based intelligence swarm with multiple physical bodies.*
