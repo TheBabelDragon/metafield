@@ -5,12 +5,13 @@ field_observation.py
 Canonical, body-agnostic observation schema for MetaField.
 
 Any physical or simulated body (lattice HMC, optical dodecahedron,
-WiFi CSI, ultrasonic, ZVS resonant/HV, …) should publish observations that conform
-to this shape. MetaField’s memory, geometry, prediction, and
-attractor layers consume this interface and remain unaware of the
-underlying sensor modality.
+WiFi CSI, ultrasonic, ZVS resonant/HV, CAN/CANtheon, …) should publish
+observations that conform to this shape. MetaField’s memory, geometry,
+prediction, and attractor layers consume this interface and remain
+unaware of the underlying sensor modality.
 
 See PHYSICAL_FIELD_SUBSTRATE.md for the architectural rationale.
+Evidence lineage (optional): schemas/evidence.py — Shared Evidence Contract.
 """
 
 from __future__ import annotations
@@ -21,6 +22,13 @@ from datetime import datetime, timezone
 import json
 
 from schemas.scarcity_clock import ScarcityClock, parse_clock
+from schemas.evidence import EvidenceLineage, EvidenceKind, EvidenceQuality
+
+
+KNOWN_BODY_TYPES = frozenset({
+    "optical", "lattice", "wifi_csi", "ultrasonic", "zvs", "sim", "other",
+    "can", "can_fd", "cantheon",
+})
 
 
 @dataclass
@@ -31,12 +39,15 @@ class FieldRegion:
     observed: Optional[float] = None
     confidence: float = 0.0
     anomaly: float = 0.0
+    unit: str = ""
     extras: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         if not d["extras"]:
             del d["extras"]
+        if not d.get("unit"):
+            d.pop("unit", None)
         return d
 
 
@@ -52,6 +63,7 @@ class FieldObservation:
     modality: Dict[str, Any] = field(default_factory=dict)
     health: str = "ok"
     schema_version: int = 2
+    evidence: Optional[EvidenceLineage] = None
 
     def resolved_clock(self) -> ScarcityClock:
         if self.clock is None:
@@ -59,7 +71,7 @@ class FieldObservation:
         return self.clock if isinstance(self.clock, ScarcityClock) else parse_clock(self.clock)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "schema_version": self.schema_version,
             "body_id": self.body_id,
             "body_type": self.body_type,
@@ -71,20 +83,25 @@ class FieldObservation:
             "modality": self.modality or None,
             "health": self.health,
         }
+        if self.evidence is not None:
+            d["evidence"] = self.evidence.to_dict()
+        return d
 
     def to_json(self, indent: Optional[int] = None) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=str)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FieldObservation":
-        regions = [
-            FieldRegion(**{k: v for k, v in r.items() if k in (
-                "region", "expected", "observed", "confidence", "anomaly", "extras"
-            )}) if isinstance(r, dict) else r
-            for r in data.get("field_regions", [])
-        ]
+        regions = []
+        for r in data.get("field_regions", []):
+            if not isinstance(r, dict):
+                regions.append(r)
+                continue
+            allowed = ("region", "expected", "observed", "confidence", "anomaly", "unit", "extras")
+            regions.append(FieldRegion(**{k: v for k, v in r.items() if k in allowed}))
         raw_clock = data.get("clock")
         clock = parse_clock(raw_clock) if raw_clock is not None else ScarcityClock.unanchored()
+        evidence = EvidenceLineage.from_dict(data.get("evidence"))
         return cls(
             body_id=data["body_id"],
             body_type=data["body_type"],
@@ -96,6 +113,7 @@ class FieldObservation:
             modality=data.get("modality") or {},
             health=data.get("health", "ok"),
             schema_version=data.get("schema_version", 2),
+            evidence=evidence,
         )
 
 
@@ -135,7 +153,7 @@ def validate_observation(obs: FieldObservation):
     problems = []
     if not obs.body_id:
         problems.append("body_id is required")
-    if obs.body_type not in ("optical", "lattice", "wifi_csi", "ultrasonic", "zvs", "sim", "other"):
+    if obs.body_type not in KNOWN_BODY_TYPES:
         problems.append(f"unknown body_type: {obs.body_type}")
     if not (0.0 <= obs.schema_version):
         problems.append("schema_version must be >= 0")
@@ -146,4 +164,9 @@ def validate_observation(obs: FieldObservation):
             problems.append(f"field_regions[{i}].confidence out of range")
         if not (0.0 <= r.anomaly <= 1.0):
             problems.append(f"field_regions[{i}].anomaly out of range")
+    if obs.evidence is not None:
+        if not isinstance(obs.evidence.kind, EvidenceKind):
+            problems.append("evidence.kind must be EvidenceKind")
+        if not isinstance(obs.evidence.quality, EvidenceQuality):
+            problems.append("evidence.quality must be EvidenceQuality")
     return problems
