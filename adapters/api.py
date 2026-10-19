@@ -37,13 +37,13 @@ def health() -> dict[str, Any]:
 
 
 def convert_envelope(envelope: dict[str, Any]) -> Any:
-    """Convert a CANtheon boundary envelope to FieldObservation(s).
+    """Convert a CANtheon boundary envelope to FieldObservation.
 
     Raises on incompatible schema. Preserves quality and timestamps.
     """
-    from adapters.cantheon_boundary import envelope_to_field_observations
+    from adapters.cantheon_boundary import boundary_to_field_observation
 
-    return envelope_to_field_observations(envelope)
+    return boundary_to_field_observation(envelope)
 
 
 def status_snapshot(*, schema_version: Optional[str] = None) -> dict[str, Any]:
